@@ -1,76 +1,69 @@
+import 'package:supabase_flutter/supabase_flutter.dart';
+
 import '../../core/config/supabase_config.dart';
-import '../../domain/models/navigation_session_model.dart';
 import '../../domain/models/user_profile_model.dart';
+import 'paged_query.dart';
 import 'repository_exception.dart';
 
 class UserRepository {
   final _client = SupabaseConfig.client;
   static const _table = 'user_profiles';
-  static const _navTable = 'navigation_sessions';
 
   Future<List<UserProfileModel>> getAll() async {
     try {
-      final rows = await _client
+      final rows = await fetchAllPages((a, b) => _client
           .from(_table)
           .select()
-          .order('created_at', ascending: false);
-      return (rows as List)
-          .map((e) => UserProfileModel.fromJson(e as Map<String, dynamic>))
-          .toList();
+          .order('created_at', ascending: false)
+          .order('id')
+          .range(a, b));
+      return rows.map(UserProfileModel.fromJson).toList();
     } catch (e) {
       throw RepositoryException('Failed to load users', e);
     }
   }
 
-  Future<UserProfileModel> verifyUser(String id, {bool verified = true}) async {
+  /// Updates one account, failing clearly when nothing was changed.
+  Future<UserProfileModel> _update(
+    String id,
+    Map<String, dynamic> values,
+    String what,
+  ) async {
     try {
-      final row = await _client
-          .from(_table)
-          .update({'is_verified': verified})
-          .eq('id', id)
-          .select()
-          .single();
-      return UserProfileModel.fromJson(row);
+      final rows =
+          await _client.from(_table).update(values).eq('id', id).select();
+      requireAffected(rows, what);
+      return UserProfileModel.fromJson(rows.first);
+    } on RepositoryException {
+      rethrow;
+    } on PostgrestException catch (e) {
+      throw RepositoryException('$what failed: ${e.message}', e);
     } catch (e) {
-      throw RepositoryException('Failed to verify user', e);
+      throw RepositoryException('$what failed', e);
     }
   }
 
-  Future<UserProfileModel> suspendUser(String id, {bool suspended = true}) async {
-    try {
-      final row = await _client
-          .from(_table)
-          .update({'is_active': !suspended})
-          .eq('id', id)
-          .select()
-          .single();
-      return UserProfileModel.fromJson(row);
-    } catch (e) {
-      throw RepositoryException('Failed to suspend user', e);
-    }
-  }
+  Future<UserProfileModel> verifyUser(String id, {bool verified = true}) =>
+      _update(id, {'is_verified': verified}, 'Updating verification');
 
-  Future<void> deleteUser(String id) async {
-    try {
-      await _client.from(_table).delete().eq('id', id);
-    } catch (e) {
-      throw RepositoryException('Failed to delete user', e);
-    }
-  }
+  Future<UserProfileModel> suspendUser(String id, {bool suspended = true}) =>
+      _update(id, {'is_active': !suspended}, 'Updating account status');
 
-  Future<List<NavigationSessionModel>> getNavigationHistory(String userId) async {
-    try {
-      final rows = await _client
-          .from(_navTable)
-          .select()
-          .eq('user_id', userId)
-          .order('started_at', ascending: false);
-      return (rows as List)
-          .map((e) =>
-              NavigationSessionModel.fromJson(e as Map<String, dynamic>))
-          .toList();
-    } catch (e) {
-      throw RepositoryException('Failed to load navigation history', e);
+  /// Accepts a pending non-student account.
+  Future<UserProfileModel> approveUser(String id) =>
+      _update(id, {'is_verified': true}, 'Approving the account');
+
+  /// Turns down a pending account: unverified and inactive, so it leaves the
+  /// pending list. Reactivating it puts it back there.
+  Future<UserProfileModel> rejectUser(String id) => _update(
+      id, {'is_verified': false, 'is_active': false}, 'Rejecting the account');
+
+  /// Sets the account's role. The Users screen checks `roleChangeBlocker`
+  /// first; db/user_roles.sql enforces the same rules in the database.
+  Future<UserProfileModel> setRole(String id, String role) async {
+    if (!kUserRoles.contains(role)) {
+      throw RepositoryException('Unknown role "$role"');
     }
+    return _update(id, {'role': role}, 'Changing the role');
   }
 }

@@ -4,6 +4,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../core/config/supabase_config.dart';
 import '../../domain/models/outdoor_edge_model.dart';
 import '../../domain/models/outdoor_node_model.dart';
+import 'paged_query.dart';
 import 'repository_exception.dart';
 
 class NodeRepository {
@@ -16,43 +17,30 @@ class NodeRepository {
 
   static const _nodeSelectWithBuilding = '*, buildings(id, name, short_name)';
 
-  /// Fetches nodes from `outdoor_nodes` (active ones by default), joining the
-  /// linked building's name.
+  /// Every `outdoor_nodes` row (paged), optionally only active ones. A null
+  /// `is_active` counts as active, as in [OutdoorNodeModel.fromJson].
+  Future<List<Map<String, dynamic>>> _selectNodes(
+      String columns, bool activeOnly) {
+    return fetchAllPages((a, b) {
+      var query = _client.from(_nodesTable).select(columns);
+      if (activeOnly) query = query.not('is_active', 'is', false);
+      return query.order('id').range(a, b);
+    });
+  }
+
   Future<List<OutdoorNodeModel>> getAllNodes({bool activeOnly = true}) async {
     try {
-      List<dynamic> rows;
+      List<Map<String, dynamic>> rows;
       try {
-        rows = activeOnly
-            ? await _client
-                .from(_nodesTable)
-                .select(_nodeSelectWithBuilding)
-                .eq('is_active', true)
-            : await _client.from(_nodesTable).select(_nodeSelectWithBuilding);
+        rows = await _selectNodes(_nodeSelectWithBuilding, activeOnly);
       } catch (embedErr) {
         // No FK relationship / column — fall back to a plain select.
         debugPrint('outdoor_nodes embedded select failed ($embedErr); '
             'retrying without buildings join');
-        rows = activeOnly
-            ? await _client.from(_nodesTable).select().eq('is_active', true)
-            : await _client.from(_nodesTable).select();
+        rows = await _selectNodes('*', activeOnly);
       }
 
-      // If the active filter returned nothing, the column may be null/false in
-      // this DB — fall back to fetching everything so the map still populates.
-      if (activeOnly && rows.isEmpty) {
-        debugPrint('outdoor_nodes: 0 rows with is_active=true, refetching all');
-        try {
-          rows = await _client
-              .from(_nodesTable)
-              .select(_nodeSelectWithBuilding);
-        } catch (_) {
-          rows = await _client.from(_nodesTable).select();
-        }
-      }
-
-      final nodes = rows
-          .map((e) => OutdoorNodeModel.fromJson(e as Map<String, dynamic>))
-          .toList();
+      final nodes = rows.map(OutdoorNodeModel.fromJson).toList();
       final withCoords =
           nodes.where((n) => n.lat != null && n.lng != null).length;
       debugPrint(
@@ -67,10 +55,9 @@ class NodeRepository {
 
   Future<List<OutdoorEdgeModel>> getAllEdges() async {
     try {
-      final rows = await _client.from(_edgesTable).select();
-      final edges = (rows as List)
-          .map((e) => OutdoorEdgeModel.fromJson(e as Map<String, dynamic>))
-          .toList();
+      final rows = await fetchAllPages((a, b) =>
+          _client.from(_edgesTable).select().order('id').range(a, b));
+      final edges = rows.map(OutdoorEdgeModel.fromJson).toList();
       debugPrint('Fetched ${edges.length} edges from Supabase');
       return edges;
     } catch (e) {
@@ -113,14 +100,38 @@ class NodeRepository {
     }
   }
 
-  /// Deletes a node and every edge it participates in.
+  /// Deletes a node and every edge it participates in, and clears
+  /// `outdoor_node_id` on any indoor node pointing at it. Those links are put
+  /// back if the delete fails.
   Future<void> deleteNode(String id) async {
     try {
-      await _client
-          .from(_edgesTable)
-          .delete()
-          .or('from_node.eq.$id,to_node.eq.$id');
-      await _client.from(_nodesTable).delete().eq('id', id.toString());
+      final unlinked = await _client
+          .from('indoor_nodes')
+          .update({'outdoor_node_id': null})
+          .eq('outdoor_node_id', id)
+          .select('id');
+      try {
+        await _client
+            .from(_edgesTable)
+            .delete()
+            .or('from_node.eq.$id,to_node.eq.$id');
+        final rows = await _client
+            .from(_nodesTable)
+            .delete()
+            .eq('id', id.toString())
+            .select('id');
+        requireAffected(rows, 'Deleting the node');
+      } catch (_) {
+        if (unlinked.isNotEmpty) {
+          await _client
+              .from('indoor_nodes')
+              .update({'outdoor_node_id': id})
+              .inFilter('id', [for (final r in unlinked) r['id'].toString()]);
+        }
+        rethrow;
+      }
+    } on RepositoryException {
+      rethrow;
     } catch (e) {
       throw RepositoryException('Failed to delete node: ${_describe(e)}', e);
     }
@@ -141,7 +152,14 @@ class NodeRepository {
 
   Future<void> deleteEdge(String id) async {
     try {
-      await _client.from(_edgesTable).delete().eq('id', id.toString());
+      final rows = await _client
+          .from(_edgesTable)
+          .delete()
+          .eq('id', id.toString())
+          .select('id');
+      requireAffected(rows, 'Deleting the edge');
+    } on RepositoryException {
+      rethrow;
     } catch (e) {
       throw RepositoryException('Failed to delete edge: ${_describe(e)}', e);
     }
@@ -151,10 +169,14 @@ class NodeRepository {
   /// half of the outdoor↔indoor entrance connection.
   Future<void> setIndoorLink(String outdoorNodeId, String? indoorNodeId) async {
     try {
-      await _client
+      final rows = await _client
           .from(_nodesTable)
           .update({'indoor_node_id': indoorNodeId})
-          .eq('id', outdoorNodeId.toString());
+          .eq('id', outdoorNodeId.toString())
+          .select('id');
+      requireAffected(rows, 'Linking outdoor node $outdoorNodeId');
+    } on RepositoryException {
+      rethrow;
     } catch (e) {
       throw RepositoryException(
           'Failed to link outdoor node: ${_describe(e)}', e);
@@ -164,17 +186,17 @@ class NodeRepository {
   Future<List<OutdoorNodeModel>> getEntranceNodesForBuilding(
       int buildingId) async {
     try {
-      final rows = await _client
+      final rows = await fetchAllPages((a, b) => _client
           .from(_nodesTable)
           .select()
           .eq('building_id', buildingId)
-          .eq('is_entrance', true);
-      return (rows as List)
-          .map((e) => OutdoorNodeModel.fromJson(e as Map<String, dynamic>))
-          .toList();
+          .eq('is_entrance', true)
+          .order('id')
+          .range(a, b));
+      return rows.map(OutdoorNodeModel.fromJson).toList();
     } catch (e) {
-      // Column may not exist yet — degrade to empty rather than break.
-      return const [];
+      throw RepositoryException(
+          'Failed to load entrance nodes: ${_describe(e)}', e);
     }
   }
 }

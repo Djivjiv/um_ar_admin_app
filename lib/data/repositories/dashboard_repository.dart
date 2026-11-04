@@ -1,8 +1,17 @@
 import 'package:http/http.dart' as http;
+import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../../core/config/maptiler_config.dart';
 import '../../core/config/supabase_config.dart';
+import '../../core/utils/date_range.dart';
+import '../../core/utils/navigation_metrics.dart';
 import '../../core/utils/parse_utils.dart';
-import '../../domain/models/announcement_model.dart';
+import '../../core/utils/short_code.dart';
+import '../../core/utils/sus_dedupe.dart';
+import '../../domain/models/feedback_comment_model.dart';
+import 'account_counts.dart';
+import 'feedback_repository.dart';
+import 'paged_query.dart';
 import 'repository_exception.dart';
 
 // ---------------------------------------------------------------------------
@@ -14,6 +23,9 @@ class DashboardTopStats {
   final int registeredAccounts;
   final int activeVisitors;
   final int activeUsers;
+
+  /// Kiosk sessions started in the selected range (`getTopStats`'s
+  /// `rangeDays`), not all time.
   final int kioskUsers;
 
   const DashboardTopStats({
@@ -27,37 +39,45 @@ class DashboardTopStats {
 
 class DailySeries {
   final List<DateTime> days;
-  final List<int> mobile; // all navigation_sessions
-  final List<int> visitor; // visitor_sessions
-  final List<int> kiosk; // kiosk_sessions
-  final List<int> registered; // navigation_sessions with a user_id
+  final List<int> registered; // trips by a signed-in user
+  final List<int> visitor; // trips by a visitor
+  final List<int> kiosk; // kiosk_sessions, a different unit: chart it apart
 
   const DailySeries({
     this.days = const [],
-    this.mobile = const [],
+    this.registered = const [],
     this.visitor = const [],
     this.kiosk = const [],
-    this.registered = const [],
   });
 
   bool get isEmpty => days.isEmpty;
 }
 
 class SusSummary {
+  /// SUS responses, from the user app.
   final int totalResponses;
+
+  /// Rows of `kiosk_survey_responses`. These are 1 to 5 ratings with no SUS
+  /// score, so they are counted apart and never go into the SUS figures.
+  final int kioskSurveys;
   final double averageScore;
   final int poor; // 0-50
   final int marginal; // 51-68
   final int good; // 69-80
   final int excellent; // 81-100
 
+  /// The one-response-per-person note, if there is anything to say.
+  final String? note;
+
   const SusSummary({
     this.totalResponses = 0,
+    this.kioskSurveys = 0,
     this.averageScore = 0,
     this.poor = 0,
     this.marginal = 0,
     this.good = 0,
     this.excellent = 0,
+    this.note,
   });
 
   String get grade {
@@ -68,12 +88,23 @@ class SusSummary {
   }
 }
 
+/// One comment for the Dashboard panel. Holds only what may be shown, as on
+/// the Suggestions screen: no name, email, user id or device code.
 class CommentEntry {
   final String text;
   final String userType; // "Student", "Visitor", "Kiosk"
+
+  /// The short anonymous id. For a kiosk comment, which has no person, the
+  /// first 8 characters of the kiosk's device_code, or null without one.
+  final String? anonymousRef;
   final DateTime? at;
 
-  const CommentEntry({required this.text, required this.userType, this.at});
+  const CommentEntry({
+    required this.text,
+    required this.userType,
+    this.anonymousRef,
+    this.at,
+  });
 }
 
 class BuildingVisit {
@@ -85,20 +116,26 @@ class BuildingVisit {
 class SystemStatus {
   final bool supabaseOk;
   final bool mapTilerOk;
-  final int totalBuildings;
-  final int totalOutdoorNodes;
-  final int totalIndoorNodes;
-  final int totalFloorPlans;
+
+  /// Null when that count could not be loaded (see [errors]).
+  final int? totalBuildings;
+  final int? totalOutdoorNodes;
+  final int? totalIndoorNodes;
+  final int? totalFloorPlans;
   final DateTime? lastDataUpdate;
+
+  /// One "Could not load …" line per count that failed.
+  final List<String> errors;
 
   const SystemStatus({
     this.supabaseOk = false,
     this.mapTilerOk = false,
-    this.totalBuildings = 0,
-    this.totalOutdoorNodes = 0,
-    this.totalIndoorNodes = 0,
-    this.totalFloorPlans = 0,
+    this.totalBuildings,
+    this.totalOutdoorNodes,
+    this.totalIndoorNodes,
+    this.totalFloorPlans,
     this.lastDataUpdate,
+    this.errors = const [],
   });
 }
 
@@ -107,6 +144,10 @@ class SystemStatus {
 // ---------------------------------------------------------------------------
 
 DateTime _dateOnly(DateTime d) => DateTime(d.year, d.month, d.day);
+
+/// Local midnight at the start of the last [days] days, today included.
+DateTime dashboardRangeStart(int days, [DateTime? now]) =>
+    _dateOnly(now ?? DateTime.now()).subtract(Duration(days: days - 1));
 
 DateTime? _anyDate(Map<String, dynamic> row, List<String> keys) {
   for (final k in keys) {
@@ -126,57 +167,105 @@ dynamic _anyValue(Map<String, dynamic> row, List<String> keys) {
 }
 
 class DashboardRepository {
+  DashboardRepository({http.Client? httpClient})
+      : _http = httpClient ?? http.Client();
+
   final _client = SupabaseConfig.client;
+  final http.Client _http;
+  final _feedback = FeedbackRepository();
 
-  static const _dateKeys = [
-    'submitted_at',
-    'created_at',
-    'started_at',
-    'inserted_at',
-    'timestamp',
-  ];
+  static const _kioskSurveyTable = 'kiosk_survey_responses';
 
-  Future<List<Map<String, dynamic>>> _safeSelect(
+  /// Every row of [table], paged and ordered by `id`, optionally limited to
+  /// rows where `dateColumn >= from`.
+  Future<List<Map<String, dynamic>>> _selectAll(
+    String table,
+    String columns, {
+    String? dateColumn,
+    DateTime? from,
+  }) {
+    return fetchAllPages((a, b) {
+      var query = _client.from(table).select(columns);
+      if (dateColumn != null && from != null) {
+        query = query.gte(dateColumn, from.toUtc().toIso8601String());
+      }
+      return query.order('id').range(a, b);
+    });
+  }
+
+  /// Rows of the kiosk survey with `from <= created_at < to`, or an empty list
+  /// when the table hasn't been created yet. Any other error is rethrown.
+  Future<List<Map<String, dynamic>>> _kioskSurveyRows(
+    DateTime from,
+    DateTime to,
+  ) async {
+    try {
+      return await fetchAllPages((a, b) => _client
+          .from(_kioskSurveyTable)
+          .select()
+          .gte('created_at', from.toUtc().toIso8601String())
+          .lt('created_at', to.toUtc().toIso8601String())
+          .order('id')
+          .range(a, b));
+    } catch (e) {
+      if (isMissingTable(e)) return <Map<String, dynamic>>[];
+      rethrow;
+    }
+  }
+
+  /// Exact row count of [table] after [filter]; no rows are downloaded.
+  Future<int> _count(
     String table, [
-    String columns = '*',
+    PostgrestFilterBuilder<int> Function(PostgrestFilterBuilder<int> q)?
+        filter,
+  ]) async {
+    final query = _client.from(table).count();
+    return await (filter == null ? query : filter(query));
+  }
+
+  /// Like [_count], but 0 when the optional table doesn't exist yet.
+  Future<int> _countOptional(
+    String table, [
+    PostgrestFilterBuilder<int> Function(PostgrestFilterBuilder<int> q)?
+        filter,
   ]) async {
     try {
-      final rows = await _client.from(table).select(columns);
-      return (rows as List).cast<Map<String, dynamic>>();
-    } catch (_) {
-      // Table may not exist yet (e.g. kiosk_* tables). Degrade gracefully.
-      return <Map<String, dynamic>>[];
+      return await _count(table, filter);
+    } catch (e) {
+      if (isMissingTable(e)) return 0;
+      rethrow;
     }
   }
 
   // ---- Row 1 -------------------------------------------------------------
 
-  Future<DashboardTopStats> getTopStats() async {
+  /// The account counts follow [countActiveAccounts], as Analytics does.
+  /// Kiosk sessions are those started in the last [rangeDays] days, today
+  /// included: the Daily Trips range.
+  Future<DashboardTopStats> getTopStats({int rangeDays = 7}) async {
     try {
-      final profiles = await _safeSelect(
-          'user_profiles', 'id, role, is_verified, is_active');
-      final visitors = await _safeSelect('visitor_sessions', 'id, is_expired');
-      final kiosk = await _safeSelect('kiosk_sessions', 'id');
-
-      final students = profiles
-          .where((p) => (p['role']?.toString().toLowerCase()) == 'student')
-          .length;
-      final verified =
-          profiles.where((p) => p['is_verified'] == true).length;
-      final activeProfiles =
-          profiles.where((p) => p['is_active'] != false).length;
-      final activeVisitors =
-          visitors.where((v) => v['is_expired'] != true).length;
+      final from = dashboardRangeStart(rangeDays);
+      final counts = await Future.wait([
+        countActiveAccounts(_client, AccountGroup.students),
+        countActiveAccounts(_client, AccountGroup.verified),
+        countActiveAccounts(_client),
+        _count('visitor_sessions',
+            (q) => applyActiveVisitorFilter(q, DateTime.now())),
+        _countOptional('kiosk_sessions',
+            (q) => q.gte('started_at', from.toUtc().toIso8601String())),
+      ]);
+      final activeVisitors = counts[3];
 
       return DashboardTopStats(
-        students: students,
-        registeredAccounts: verified,
+        students: counts[0],
+        registeredAccounts: counts[1],
         activeVisitors: activeVisitors,
-        activeUsers: activeProfiles + activeVisitors,
-        kioskUsers: kiosk.length,
+        activeUsers: counts[2] + activeVisitors,
+        kioskUsers: counts[4],
       );
     } catch (e) {
-      throw RepositoryException('Failed to load dashboard stats', e);
+      throw RepositoryException(
+          'Could not load user statistics: ${describeError(e)}', e);
     }
   }
 
@@ -184,17 +273,15 @@ class DashboardRepository {
 
   Future<DailySeries> getDailySeries(int days) async {
     try {
-      final now = _dateOnly(DateTime.now());
-      final start = now.subtract(Duration(days: days - 1));
+      final start = dashboardRangeStart(days);
       final dayList = [
         for (var i = 0; i < days; i++) start.add(Duration(days: i)),
       ];
       final index = {for (var i = 0; i < dayList.length; i++) dayList[i]: i};
 
-      final mobile = List<int>.filled(days, 0);
+      final registered = List<int>.filled(days, 0);
       final visitor = List<int>.filled(days, 0);
       final kiosk = List<int>.filled(days, 0);
-      final registered = List<int>.filled(days, 0);
 
       void bucket(
         List<Map<String, dynamic>> rows,
@@ -211,31 +298,44 @@ class DashboardRepository {
         }
       }
 
-      final navRows =
-          await _safeSelect('navigation_sessions', 'id, started_at, user_id');
-      // Mobile line: every navigation session that day.
-      bucket(navRows, mobile, ['started_at', 'created_at']);
-      // "Registered" bar: navigation sessions by a logged-in registered user.
+      // `*` so a table without trip_id yet gives no trips, not an error.
+      final navRows = await _selectAll('navigation_sessions', '*',
+          dateColumn: 'started_at', from: start);
+      final tripRows = [
+        for (final t in groupNavigationTrips(navRows)) t.start,
+      ];
+      // Both lines count trips, so together they are every trip that day.
       bucket(
-        navRows,
+        tripRows,
         registered,
         ['started_at', 'created_at'],
-        where: (r) =>
-            r['user_id'] != null && r['user_id'].toString().isNotEmpty,
+        where: (r) => !isVisitorRow(r),
       );
-      bucket(await _safeSelect('visitor_sessions', 'id, started_at'), visitor,
-          ['started_at', 'created_at']);
-      bucket(await _safeSelect('kiosk_sessions'), kiosk, _dateKeys);
+      bucket(
+        tripRows,
+        visitor,
+        ['started_at', 'created_at'],
+        where: isVisitorRow,
+      );
+      List<Map<String, dynamic>> kioskRows;
+      try {
+        kioskRows = await _selectAll('kiosk_sessions', 'id, started_at',
+            dateColumn: 'started_at', from: start);
+      } catch (e) {
+        if (!isMissingTable(e)) rethrow;
+        kioskRows = const [];
+      }
+      bucket(kioskRows, kiosk, ['started_at']);
 
       return DailySeries(
         days: dayList,
-        mobile: mobile,
+        registered: registered,
         visitor: visitor,
         kiosk: kiosk,
-        registered: registered,
       );
     } catch (e) {
-      throw RepositoryException('Failed to load daily activity', e);
+      throw RepositoryException(
+          'Could not load daily activity: ${describeError(e)}', e);
     }
   }
 
@@ -243,11 +343,11 @@ class DashboardRepository {
 
   Future<SusSummary> getSusSummary() async {
     try {
-      final web = await _safeSelect('sus_responses', 'sus_score');
-      final kiosk = await _safeSelect('kiosk_sus_responses');
+      final dedupe = dedupeSusRows(await _selectAll('sus_responses', '*'));
+      final web = dedupe.kept;
 
       final scores = <double>[];
-      for (final r in [...web, ...kiosk]) {
+      for (final r in web) {
         final s = parseDouble(_anyValue(r, ['sus_score', 'score']));
         if (s != null) scores.add(s);
       }
@@ -266,7 +366,8 @@ class DashboardRepository {
       }
 
       return SusSummary(
-        totalResponses: web.length + kiosk.length,
+        totalResponses: web.length,
+        kioskSurveys: await _countOptional(_kioskSurveyTable),
         averageScore: scores.isEmpty
             ? 0
             : scores.reduce((a, b) => a + b) / scores.length,
@@ -274,72 +375,72 @@ class DashboardRepository {
         marginal: marginal,
         good: good,
         excellent: excellent,
+        note: susDedupeNote(dedupe),
       );
     } catch (e) {
-      throw RepositoryException('Failed to load SUS summary', e);
+      throw RepositoryException(
+          'Could not load survey results: ${describeError(e)}', e);
     }
   }
 
   // ---- Row 4 right ------------------------------------------------------
 
+  /// The day's comments: `feedback_comments` from the user app, through the
+  /// same model as the Suggestions screen so they are anonymised the same
+  /// way, and the kiosk survey's free text.
   Future<List<CommentEntry>> getComments(DateTime day) async {
     try {
-      final target = _dateOnly(day);
-      final web = await _safeSelect('sus_responses');
-      final kiosk = await _safeSelect('kiosk_sus_responses');
+      final span = wholeDays(day, day);
+      final load = await _feedback.getComments(from: span.from, to: span.to);
+      final kiosk = await _kioskSurveyRows(span.from, span.to);
 
-      final entries = <CommentEntry>[];
-
-      void collect(
-          List<Map<String, dynamic>> rows, String fallbackType) {
-        for (final r in rows) {
-          final comment =
-              _anyValue(r, ['comment', 'comments', 'feedback'])?.toString();
-          if (comment == null || comment.trim().isEmpty) continue;
-          final at = _anyDate(r, _dateKeys);
-          if (at == null || _dateOnly(at) != target) continue;
-          final rawType =
-              _anyValue(r, ['user_type', 'type'])?.toString().trim();
-          entries.add(CommentEntry(
-            text: comment.trim(),
-            userType: (rawType == null || rawType.isEmpty)
-                ? fallbackType
-                : _prettyType(rawType),
-            at: at,
-          ));
-        }
-      }
-
-      collect(web, 'Student');
-      collect(kiosk, 'Kiosk');
-
+      final entries = [
+        for (final c in load.rows)
+          if (c.comment.isNotEmpty)
+            CommentEntry(
+              text: c.comment,
+              userType: _prettyRole(c.role),
+              anonymousRef: c.anonymousRef,
+              at: c.createdAt,
+            ),
+        for (final r in kiosk)
+          if ((r['comments']?.toString().trim() ?? '').isNotEmpty)
+            CommentEntry(
+              text: removeEmails(r['comments'].toString().trim()),
+              userType: 'Kiosk',
+              anonymousRef: _kioskCode(r),
+              at: parseDate(r['created_at']),
+            ),
+      ];
       entries.sort((a, b) =>
           (b.at ?? DateTime(0)).compareTo(a.at ?? DateTime(0)));
       return entries;
     } catch (e) {
-      throw RepositoryException('Failed to load comments', e);
+      throw RepositoryException(
+          'Could not load comments: ${describeError(e)}', e);
     }
   }
 
-  String _prettyType(String raw) {
-    final r = raw.toLowerCase();
-    if (r.contains('visit')) return 'Visitor';
-    if (r.contains('kiosk')) return 'Kiosk';
-    if (r.contains('student')) return 'Student';
-    return raw[0].toUpperCase() + raw.substring(1);
+  /// The kiosk's `device_code`, shortened, or null when the row has none or
+  /// the column doesn't exist yet (the kiosk app's kiosk_device_code.sql).
+  String? _kioskCode(Map<String, dynamic> row) {
+    final code = row['device_code']?.toString().trim() ?? '';
+    return code.isEmpty ? null : shortId(code);
   }
+
+  String _prettyRole(String? role) => role == null
+      ? 'Unknown role'
+      : role[0].toUpperCase() + role.substring(1);
 
   // ---- Row 5 left ------------------------------------------------------
 
   Future<List<BuildingVisit>> getMostVisited({int limit = 6}) async {
     try {
-      final rows =
-          await _safeSelect('navigation_sessions', 'to_name');
+      final rows = await _selectAll('navigation_sessions', '*');
       final counts = <String, int>{};
-      for (final r in rows) {
-        final name = r['to_name']?.toString().trim() ?? '';
-        if (name.isEmpty) continue;
-        counts[name] = (counts[name] ?? 0) + 1;
+      for (final t in groupNavigationTrips(rows)) {
+        if (t.toName.isEmpty) continue;
+        counts[t.toName] = (counts[t.toName] ?? 0) + 1;
       }
       final sorted = counts.entries.toList()
         ..sort((a, b) => b.value.compareTo(a.value));
@@ -347,54 +448,56 @@ class DashboardRepository {
         for (final e in sorted.take(limit)) BuildingVisit(e.key, e.value),
       ];
     } catch (e) {
-      throw RepositoryException('Failed to load most visited buildings', e);
-    }
-  }
-
-  // ---- Row 5 center ---------------------------------------------------
-
-  Future<List<AnnouncementModel>> getRecentAnnouncements({int limit = 5}) async {
-    try {
-      final rows = await _client
-          .from('announcements')
-          .select()
-          .order('created_at', ascending: false)
-          .limit(limit);
-      return (rows as List)
-          .map((e) => AnnouncementModel.fromJson(e as Map<String, dynamic>))
-          .toList();
-    } catch (e) {
-      throw RepositoryException('Failed to load announcements', e);
+      throw RepositoryException(
+          'Could not load most visited buildings: ${describeError(e)}', e);
     }
   }
 
   // ---- Row 5 right ---------------------------------------------------
 
   Future<SystemStatus> getSystemStatus() async {
+    final errors = <String>[];
     var supabaseOk = false;
     DateTime? lastUpdate;
-    var buildings = 0, outdoor = 0, indoor = 0, floors = 0;
+    int? buildings;
 
     try {
-      final b = await _client
+      buildings = await _count(
+          'buildings', (q) => q.not('is_active', 'is', false));
+      final latest = await _client
           .from('buildings')
-          .select('id, updated_at')
-          .order('updated_at', ascending: false);
+          .select('updated_at')
+          .order('updated_at', ascending: false, nullsFirst: false)
+          .limit(1);
       supabaseOk = true;
-      final list = (b as List).cast<Map<String, dynamic>>();
-      buildings = list.length;
-      if (list.isNotEmpty) {
-        lastUpdate = parseDate(list.first['updated_at']);
+      if (latest.isNotEmpty) {
+        lastUpdate = parseDate(latest.first['updated_at']);
       }
-    } catch (_) {
-      supabaseOk = false;
+    } catch (e) {
+      errors.add('Could not load buildings: ${describeError(e)}');
     }
 
-    outdoor = (await _safeSelect('outdoor_nodes', 'id')).length;
-    indoor = (await _safeSelect('indoor_nodes', 'id')).length;
-    floors = (await _safeSelect('building_floors', 'id')).length;
+    Future<int?> countOrNull(String table, String label) async {
+      try {
+        return await _count(table, (q) => q.not('is_active', 'is', false));
+      } catch (e) {
+        errors.add('Could not load $label: ${describeError(e)}');
+        return null;
+      }
+    }
 
-    final mapTilerOk = await _pingMapTiler();
+    final outdoor = await countOrNull('outdoor_nodes', 'outdoor nodes');
+    final indoor = await countOrNull('indoor_nodes', 'indoor nodes');
+    final floors = await countOrNull('building_floors', 'floor plans');
+
+    var mapTilerOk = false;
+    if (!MapTilerConfig.isConfigured) {
+      errors.add(MapTilerConfig.missingKeyMessage);
+    } else {
+      final problem = await mapTilerKeyProblem(_http, MapTilerConfig.apiKey);
+      if (problem != null) errors.add(problem);
+      mapTilerOk = problem == null;
+    }
 
     return SystemStatus(
       supabaseOk: supabaseOk,
@@ -404,18 +507,30 @@ class DashboardRepository {
       totalIndoorNodes: indoor,
       totalFloorPlans: floors,
       lastDataUpdate: lastUpdate,
+      errors: errors,
     );
   }
+}
 
-  Future<bool> _pingMapTiler() async {
-    try {
-      final res = await http
-          .get(Uri.parse('https://api.maptiler.com/'))
-          .timeout(const Duration(seconds: 6));
-      // Any HTTP response (even 4xx without a key) means the API is reachable.
-      return res.statusCode > 0;
-    } catch (_) {
-      return false;
-    }
+/// Why MapTiler won't serve tiles with [key], or null when it will. Asks for
+/// a small style file that needs the key, so only a 200 counts as working:
+/// any other reply, a rejected key included, is a failure.
+Future<String?> mapTilerKeyProblem(http.Client client, String key) async {
+  final http.Response res;
+  try {
+    res = await client
+        .get(Uri.https(
+            'api.maptiler.com', '/maps/streets-v2/style.json', {'key': key}))
+        .timeout(const Duration(seconds: 6));
+  } catch (_) {
+    return 'Could not reach MapTiler, so map tiles may not load. Check the '
+        'internet connection.';
   }
+  return switch (res.statusCode) {
+    200 => null,
+    401 || 403 => 'MapTiler rejected the key (HTTP ${res.statusCode}). Check '
+        'MAPTILER_KEY and the domains the key allows in the MapTiler '
+        'dashboard.',
+    final code => 'MapTiler answered HTTP $code, so map tiles may not load.',
+  };
 }

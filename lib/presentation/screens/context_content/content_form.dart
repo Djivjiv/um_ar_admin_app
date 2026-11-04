@@ -78,7 +78,7 @@ class _ContentFormState extends State<ContentForm> {
       context.showSuccess(_isEdit ? 'Content updated' : 'Content created');
       Navigator.of(context).pop(true);
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _save);
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -95,11 +95,14 @@ class _ContentFormState extends State<ContentForm> {
               style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
           const SizedBox(height: 6),
           DropdownButtonFormField<int?>(
-            initialValue: _buildingId,
+            initialValue: widget.buildings.any((b) => b.id == _buildingId)
+                ? _buildingId
+                : null,
             items: [
               const DropdownMenuItem(value: null, child: Text('None')),
               for (final b in widget.buildings)
-                DropdownMenuItem(value: b.id, child: Text(b.name)),
+                DropdownMenuItem(
+                    value: b.id, child: Text(buildingOptionLabel(b))),
             ],
             onChanged: (v) => setState(() => _buildingId = v),
           ),

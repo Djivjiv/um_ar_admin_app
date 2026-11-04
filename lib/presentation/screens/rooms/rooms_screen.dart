@@ -5,12 +5,17 @@ import '../../../core/constants/app_colors.dart';
 import '../../../core/constants/no_rooms_buildings.dart';
 import '../../../core/utils/ui_helpers.dart';
 import '../../../data/repositories/building_repository.dart';
+import '../../../data/repositories/paged_query.dart';
 import '../../../data/repositories/room_repository.dart';
+import '../../../domain/models/access_level.dart';
 import '../../../domain/models/building_model.dart';
 import '../../../domain/models/room_model.dart';
+import '../../widgets/access_level_fields.dart';
+import '../../widgets/active_filter_dropdown.dart';
 import '../../widgets/confirm_dialog.dart';
 import '../../widgets/data_table_card.dart';
 import '../../widgets/slide_panel.dart';
+import '../../widgets/status_badge.dart';
 import 'room_form.dart';
 
 class RoomsScreen extends StatefulWidget {
@@ -31,6 +36,8 @@ class _RoomsScreenState extends State<RoomsScreen> {
   bool _loading = true;
   Object? _error;
   int? _filterBuildingId;
+  ActiveFilter _status = ActiveFilter.active;
+  String? _filterAccess;
 
   @override
   void initState() {
@@ -45,10 +52,12 @@ class _RoomsScreenState extends State<RoomsScreen> {
       _error = null;
     });
     try {
-      final buildings = await _buildingRepo.getAll();
+      // Every building, for names; pickers narrow it to the active ones.
+      final buildings = await _buildingRepo.getAll(status: ActiveFilter.all);
       final rooms = _filterBuildingId != null
-          ? await _roomRepo.getByBuilding(_filterBuildingId!)
-          : await _roomRepo.getAll();
+          ? await _roomRepo.getByBuilding(_filterBuildingId!,
+              status: _status, accessLevel: _filterAccess)
+          : await _roomRepo.getAll(status: _status, accessLevel: _filterAccess);
       setState(() {
         _buildings = buildings;
         _rooms = rooms;
@@ -62,14 +71,17 @@ class _RoomsScreenState extends State<RoomsScreen> {
     }
   }
 
-  /// Buildings that can actually contain rooms (excludes [noRoomsBuildings]).
+  /// Active buildings that can actually contain rooms (excludes
+  /// [noRoomsBuildings]), plus the one being filtered on.
   List<BuildingModel> get _roomableBuildings =>
-      _buildings.where((b) => buildingHasRooms(b.name)).toList();
+      selectableBuildings(_buildings, _filterBuildingId)
+          .where((b) => buildingHasRooms(b.name))
+          .toList();
 
   String _buildingName(int? id) {
     if (id == null) return '—';
     final match = _buildings.where((b) => b.id == id);
-    return match.isEmpty ? '#$id' : match.first.name;
+    return match.isEmpty ? '#$id' : buildingOptionLabel(match.first);
   }
 
   int _floorRank(String? floor) =>
@@ -99,11 +111,12 @@ class _RoomsScreenState extends State<RoomsScreen> {
       title: room == null ? 'Add Room' : 'Edit Room',
       subtitle: room?.roomname,
       body: RoomForm(
-        // The form's building selector keeps every building so editing a room
-        // already attached to one never breaks; only the screen's *filter*
-        // dropdown hides the no-rooms buildings.
+        // The form's building selector keeps no-rooms buildings and the
+        // room's own building (even if inactive) so editing it never breaks;
+        // only the screen's *filter* dropdown hides the no-rooms buildings.
         room: room,
-        buildings: _buildings,
+        buildings: selectableBuildings(
+            _buildings, room?.buildingId ?? _filterBuildingId),
         defaultBuildingId: _filterBuildingId,
       ),
     );
@@ -111,14 +124,43 @@ class _RoomsScreenState extends State<RoomsScreen> {
   }
 
   Future<void> _delete(RoomModel r) async {
-    final ok = await ConfirmDialog.show(context, itemName: r.roomname);
+    final ok = await ConfirmDialog.show(
+      context,
+      itemName: r.roomname,
+      message: 'Floor plan nodes linked to this room will be unlinked. '
+          'This action cannot be undone.',
+    );
     if (!ok) return;
     try {
       await _roomRepo.delete(r.id!);
       if (mounted) context.showSuccess('Room deleted');
       _load();
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: () => _delete(r));
+    }
+  }
+
+  /// Flips `is_active`, warning first when indoor nodes point at the room.
+  Future<void> _toggleActive(RoomModel r) async {
+    try {
+      if (r.isActive) {
+        final linked = await _roomRepo.linkedNodeCount(r.id!);
+        if (!mounted) return;
+        final ok = await ConfirmDialog.showDeactivate(
+          context,
+          itemName: r.roomname,
+          linkedNodes: linked,
+        );
+        if (!ok) return;
+      }
+      await _roomRepo.toggleActive(r.id!, !r.isActive);
+      if (mounted) {
+        context.showSuccess(
+            r.isActive ? 'Room deactivated' : 'Room reactivated');
+      }
+      _load();
+    } catch (e) {
+      if (mounted) context.showError(e, onRetry: () => _toggleActive(r));
     }
   }
 
@@ -143,13 +185,30 @@ class _RoomsScreenState extends State<RoomsScreen> {
                   const DropdownMenuItem(
                       value: null, child: Text('All buildings')),
                   for (final b in roomable)
-                    DropdownMenuItem(value: b.id, child: Text(b.name)),
+                    DropdownMenuItem(
+                        value: b.id, child: Text(buildingOptionLabel(b))),
                 ],
                 onChanged: (v) {
                   setState(() => _filterBuildingId = v);
                   _load();
                 },
               ),
+            ),
+            const SizedBox(width: 12),
+            ActiveFilterDropdown(
+              value: _status,
+              onChanged: (v) {
+                setState(() => _status = v);
+                _load();
+              },
+            ),
+            const SizedBox(width: 12),
+            AccessLevelFilterDropdown(
+              value: _filterAccess,
+              onChanged: (v) {
+                setState(() => _filterAccess = v);
+                _load();
+              },
             ),
             const Spacer(),
             ElevatedButton.icon(
@@ -181,7 +240,9 @@ class _RoomsScreenState extends State<RoomsScreen> {
                     DataColumn2(label: Text('Building'), size: ColumnSize.L),
                     DataColumn2(label: Text('Floor'), size: ColumnSize.S),
                     DataColumn2(label: Text('Type'), size: ColumnSize.M),
-                    DataColumn2(label: Text('Services'), size: ColumnSize.M),
+                    DataColumn2(label: Text('Access'), size: ColumnSize.M),
+                    DataColumn2(label: Text('Services'), size: ColumnSize.S),
+                    DataColumn2(label: Text('Status'), size: ColumnSize.S),
                     DataColumn2(label: Text('Actions'), size: ColumnSize.M),
                   ],
                   rows: [
@@ -192,9 +253,21 @@ class _RoomsScreenState extends State<RoomsScreen> {
                           DataCell(Text(_buildingName(r.buildingId))),
                           DataCell(Text(r.floor ?? '—')),
                           DataCell(Text(r.type ?? '—')),
+                          DataCell(Text(accessLevelLabel(r.accessLevel))),
                           DataCell(Text('${r.services.length}')),
+                          DataCell(StatusBadge.fromBool(r.isActive)),
                           DataCell(Row(
                             children: [
+                              IconButton(
+                                tooltip:
+                                    r.isActive ? 'Deactivate' : 'Reactivate',
+                                icon: Icon(
+                                    r.isActive
+                                        ? Icons.block
+                                        : Icons.lock_open,
+                                    size: 18),
+                                onPressed: () => _toggleActive(r),
+                              ),
                               IconButton(
                                 tooltip: 'Edit',
                                 icon: const Icon(Icons.edit, size: 18),

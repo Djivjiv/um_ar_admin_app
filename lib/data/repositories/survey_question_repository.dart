@@ -2,6 +2,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../core/config/supabase_config.dart';
 import '../../domain/models/survey_question_model.dart';
+import 'paged_query.dart';
 import 'repository_exception.dart';
 
 class SurveyQuestionRepository {
@@ -14,13 +15,13 @@ class SurveyQuestionRepository {
   /// faked locally, so an empty/missing table surfaces as a real error.
   Future<List<SurveyQuestionModel>> getAll() async {
     try {
-      final rows = await _client
+      final rows = await fetchAllPages((a, b) => _client
           .from(_table)
           .select()
-          .order('question_number', ascending: true);
-      return (rows as List)
-          .map((e) => SurveyQuestionModel.fromJson(e as Map<String, dynamic>))
-          .toList();
+          .order('question_number', ascending: true)
+          .order('id')
+          .range(a, b));
+      return rows.map(SurveyQuestionModel.fromJson).toList();
     } on PostgrestException catch (e) {
       throw RepositoryException(
           'Failed to load survey questions: ${e.message}', e);

@@ -5,12 +5,17 @@ import '../../../core/constants/app_colors.dart';
 import '../../../core/utils/ui_helpers.dart';
 import '../../../data/repositories/building_repository.dart';
 import '../../../data/repositories/facility_repository.dart';
+import '../../../data/repositories/paged_query.dart';
+import '../../../domain/models/access_level.dart';
 import '../../../domain/models/building_model.dart';
 import '../../../domain/models/facility_model.dart';
+import '../../widgets/access_level_fields.dart';
+import '../../widgets/active_filter_dropdown.dart';
 import '../../widgets/confirm_dialog.dart';
 import '../../widgets/data_table_card.dart';
 import '../../widgets/form_input.dart';
 import '../../widgets/slide_panel.dart';
+import '../../widgets/status_badge.dart';
 import '../../widgets/tag_input.dart';
 
 const _categories = <String>[
@@ -95,6 +100,9 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
 
   int? _filterBuildingId;
   String? _filterCategory;
+
+  ActiveFilter _status = ActiveFilter.active;
+  String? _filterAccess;
   String _search = '';
   int _page = 0;
   static const _perPage = 10;
@@ -117,11 +125,14 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
       _error = null;
     });
     try {
-      final buildings = await _buildingRepo.getAll();
+      // Every building, for names; pickers narrow it to the active ones.
+      final buildings = await _buildingRepo.getAll(status: ActiveFilter.all);
       final facilities = await _repo.getAll(
         buildingId: _filterBuildingId,
         category: _filterCategory,
         search: _search,
+        status: _status,
+        accessLevel: _filterAccess,
       );
       if (!mounted) return;
       setState(() {
@@ -142,7 +153,7 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
   String _buildingName(int? id) {
     if (id == null) return '—';
     final match = _buildings.where((b) => b.id == id);
-    return match.isEmpty ? '#$id' : match.first.name;
+    return match.isEmpty ? '#$id' : buildingOptionLabel(match.first);
   }
 
   Future<void> _openForm([FacilityModel? facility]) async {
@@ -152,7 +163,7 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
       subtitle: facility?.roomname,
       body: _FacilityForm(
         facility: facility,
-        buildings: _buildings,
+        buildings: selectableBuildings(_buildings, facility?.buildingId),
         repo: _repo,
       ),
     );
@@ -175,7 +186,8 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
     final ok = await ConfirmDialog.show(
       context,
       itemName: facility.roomname ?? 'facility',
-      message: 'Delete $name? This will also delete all facility details.',
+      message: 'Delete $name? This will also delete all facility details, '
+          'and floor plan nodes linked to it will be unlinked.',
     );
     if (!ok) return;
     try {
@@ -183,7 +195,7 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
       if (mounted) context.showSuccess('Facility deleted');
       _load();
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: () => _delete(facility));
     }
   }
 
@@ -196,8 +208,9 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
     final end = start + _perPage > total ? total : start + _perPage;
     final pageItems = _facilities.sublist(start, end);
 
+    final filterBuildings = selectableBuildings(_buildings, _filterBuildingId);
     final buildingFilterValue =
-        _buildings.any((b) => b.id == _filterBuildingId)
+        filterBuildings.any((b) => b.id == _filterBuildingId)
             ? _filterBuildingId
             : null;
 
@@ -229,10 +242,11 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
                 items: [
                   const DropdownMenuItem<int?>(
                       value: null, child: Text('All Buildings')),
-                  for (final b in _buildings)
+                  for (final b in filterBuildings)
                     DropdownMenuItem<int?>(
                       value: b.id,
-                      child: Text(b.name, overflow: TextOverflow.ellipsis),
+                      child: Text(buildingOptionLabel(b),
+                          overflow: TextOverflow.ellipsis),
                     ),
                 ],
                 onChanged: (v) {
@@ -260,6 +274,22 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
                   _load();
                 },
               ),
+            ),
+            const SizedBox(width: 12),
+            ActiveFilterDropdown(
+              value: _status,
+              onChanged: (v) {
+                setState(() => _status = v);
+                _load();
+              },
+            ),
+            const SizedBox(width: 12),
+            AccessLevelFilterDropdown(
+              value: _filterAccess,
+              onChanged: (v) {
+                setState(() => _filterAccess = v);
+                _load();
+              },
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -293,7 +323,7 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
               : DataTableCard(
                   title: '$total ${total == 1 ? 'Facility' : 'Facilities'}',
                   isLoading: _loading,
-                  minWidth: 980,
+                  minWidth: 1080,
                   emptyMessage: 'No facilities found',
                   columns: const [
                     DataColumn2(
@@ -303,6 +333,8 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
                     DataColumn2(label: Text('Category'), size: ColumnSize.M),
                     DataColumn2(
                         label: Text('Room Number'), size: ColumnSize.M),
+                    DataColumn2(label: Text('Access'), size: ColumnSize.M),
+                    DataColumn2(label: Text('Status'), size: ColumnSize.S),
                     DataColumn2(label: Text('Actions'), size: ColumnSize.S),
                   ],
                   rows: [
@@ -332,6 +364,12 @@ class _FacilitiesScreenState extends State<FacilitiesScreen> {
                             style: const TextStyle(
                                 color: AppColors.textSecondary),
                           )),
+                          DataCell(Text(
+                            accessLevelLabel(f.accessLevel),
+                            style: const TextStyle(
+                                color: AppColors.textSecondary),
+                          )),
+                          DataCell(StatusBadge.fromBool(f.isActive)),
                           DataCell(Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -441,10 +479,12 @@ class _FacilityFormState extends State<_FacilityForm> {
 
   int? _buildingId;
   String? _category;
+  late String _accessLevel;
   late List<String> _description;
   late List<String> _services;
   late List<String> _payment;
   late List<String> _instructions;
+  late bool _isActive;
   bool _saving = false;
 
   bool get _isEdit => widget.facility != null;
@@ -467,6 +507,8 @@ class _FacilityFormState extends State<_FacilityForm> {
     _services = List.of(f?.services ?? const []);
     _payment = List.of(f?.paymentMethod ?? const []);
     _instructions = List.of(f?.instructions ?? const []);
+    _isActive = f?.isActive ?? true;
+    _accessLevel = selectedAccessLevel(f?.accessLevel);
   }
 
   @override
@@ -492,6 +534,17 @@ class _FacilityFormState extends State<_FacilityForm> {
     }
     setState(() => _saving = true);
     try {
+      final existing = widget.facility;
+      if (existing != null && existing.isActive && !_isActive) {
+        final linked = await widget.repo.linkedNodeCount(existing.id!);
+        if (!mounted) return;
+        final ok = await ConfirmDialog.showDeactivate(
+          context,
+          itemName: _name.text.trim(),
+          linkedNodes: linked,
+        );
+        if (!ok) return;
+      }
       String? nn(String s) => s.trim().isEmpty ? null : s.trim();
       final model = FacilityModel(
         id: widget.facility?.id,
@@ -501,7 +554,10 @@ class _FacilityFormState extends State<_FacilityForm> {
         floor: int.tryParse(_floor.text.trim()),
         location: nn(_location.text),
         facilityCategories: _category,
+        accessLevel:
+            accessLevelToSave(_accessLevel, widget.facility?.accessLevel),
         description: _description,
+        isActive: _isActive,
         officeHours: nn(_officeHours.text),
         contactNumber: nn(_contact.text),
         services: _services,
@@ -517,7 +573,7 @@ class _FacilityFormState extends State<_FacilityForm> {
       context.showSuccess(_isEdit ? 'Facility updated' : 'Facility created');
       Navigator.of(context).pop(true);
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _save);
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -557,7 +613,8 @@ class _FacilityFormState extends State<_FacilityForm> {
               for (final b in buildings)
                 DropdownMenuItem(
                   value: b.id,
-                  child: Text(b.name, overflow: TextOverflow.ellipsis),
+                  child: Text(buildingOptionLabel(b),
+                      overflow: TextOverflow.ellipsis),
                 ),
             ],
             onChanged: (v) => setState(() => _buildingId = v),
@@ -598,6 +655,12 @@ class _FacilityFormState extends State<_FacilityForm> {
             ],
           ),
           const SizedBox(height: 14),
+          AccessLevelField(
+            value: _accessLevel,
+            stored: widget.facility?.accessLevel,
+            onChanged: (v) => setState(() => _accessLevel = v),
+          ),
+          const SizedBox(height: 14),
           FormInput(
             label: 'Location',
             controller: _location,
@@ -609,6 +672,12 @@ class _FacilityFormState extends State<_FacilityForm> {
             initialTags: _description,
             hint: 'Add a description line and press Enter',
             onChanged: (v) => _description = v,
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Active'),
+            value: _isActive,
+            onChanged: (v) => setState(() => _isActive = v),
           ),
           const SizedBox(height: 20),
           _sectionLabel('Facility Details'),
@@ -771,6 +840,7 @@ class _FacilityDetailView extends StatelessWidget {
               ),
             if ((f.facilityCategories ?? '').isNotEmpty)
               _categoryPill(f.facilityCategories),
+            StatusBadge.fromBool(f.isActive),
           ],
         ),
         const SizedBox(height: 8),
@@ -794,6 +864,11 @@ class _FacilityDetailView extends StatelessWidget {
               child: Text('•  $d', style: const TextStyle(fontSize: 13)),
             ),
         ],
+        const SizedBox(height: 4),
+        Text(
+          'Access: ${accessLevelLabel(f.accessLevel)}',
+          style: const TextStyle(fontSize: 13, color: AppColors.textSecondary),
+        ),
         const Divider(height: 26),
         if ((f.officeHours ?? '').isNotEmpty)
           _IconLine(icon: Icons.schedule, text: f.officeHours!),

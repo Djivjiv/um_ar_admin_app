@@ -2,25 +2,33 @@ import 'dart:collection';
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/gestures.dart' show kPrimaryButton;
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
-import 'package:latlong2/latlong.dart' hide Path;
 
 import '../../../core/constants/app_colors.dart';
+import '../../../core/utils/floor_scale.dart';
 import '../../../core/utils/ui_helpers.dart';
 import '../../../data/repositories/building_repository.dart';
+import '../../../data/repositories/entrance_link_repository.dart';
 import '../../../data/repositories/facility_repository.dart';
+import '../../../data/repositories/floor_distance_repository.dart';
 import '../../../data/repositories/floor_plan_repository.dart';
+import '../../../data/repositories/indoor_link_cleanup.dart';
 import '../../../data/repositories/node_repository.dart';
+import '../../../data/repositories/paged_query.dart';
 import '../../../data/repositories/room_repository.dart';
 import '../../../domain/models/building_model.dart';
 import '../../../domain/models/facility_model.dart';
+import '../../../domain/models/floor_distance_model.dart';
 import '../../../domain/models/floor_plan_model.dart';
 import '../../../domain/models/indoor_edge_model.dart';
 import '../../../domain/models/indoor_node_model.dart';
 import '../../../domain/models/outdoor_node_model.dart';
 import '../../../domain/models/room_model.dart';
 import '../../widgets/confirm_dialog.dart';
+import '../../widgets/error_banner.dart';
+import 'floor_distance_panel.dart';
 
 // --- label config ------------------------------------------------------------
 
@@ -245,14 +253,22 @@ enum _RtTarget { roomFacility, node }
 
 enum _Tab { nodes, edges, route }
 
-enum _Mode { none, addNode, addEdge }
+enum _Mode { none, addNode, addEdge, addDistance, moveNodes }
 
 enum _NavFilter { all, navigation, informational }
 
 class FloorPlanEditorScreen extends StatefulWidget {
   final int floorPlanId;
 
-  const FloorPlanEditorScreen({super.key, required this.floorPlanId});
+  /// Stands in for the plan image, which a widget test can't download.
+  @visibleForTesting
+  final Size? testImageSize;
+
+  const FloorPlanEditorScreen({
+    super.key,
+    required this.floorPlanId,
+    this.testImageSize,
+  });
 
   @override
   State<FloorPlanEditorScreen> createState() => _FloorPlanEditorScreenState();
@@ -261,9 +277,11 @@ class FloorPlanEditorScreen extends StatefulWidget {
 class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
   final _repo = FloorPlanRepository();
   final _nodeRepo = NodeRepository();
+  final _entranceRepo = EntranceLinkRepository();
   final _roomRepo = RoomRepository();
   final _facilityRepo = FacilityRepository();
   final _buildingRepo = BuildingRepository();
+  final _distanceRepo = FloorDistanceRepository();
   final _transform = TransformationController();
 
   FloorPlanModel? _plan;
@@ -281,11 +299,22 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
   /// Every stair/elevator node in the building that has a stair_group set.
   List<IndoorNodeModel> _stairGroupNodes = [];
 
+  /// All buildings and floor plans — for the cross-building dropdowns and
+  /// "Connected to GET Building Floor 1" captions.
+  List<BuildingModel> _allBuildings = [];
+  final Map<int, FloorPlanModel> _allPlans = {};
+
+  /// Every node (any building) carrying a cross_building_ref.
+  List<IndoorNodeModel> _crossNodes = [];
+
   bool _loading = true;
   bool _saving = false;
   Object? _error;
 
-  Size? _imageSize;
+  /// Secondary data (rooms, facilities, …) that failed in the last [_load].
+  List<String> _loadFailures = const [];
+
+  late Size? _imageSize = widget.testImageSize;
   double _scale = 1;
 
   _Tab _tab = _Tab.nodes;
@@ -298,6 +327,31 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
   String? _edgeFromId;
   String? _edgeToId;
 
+  // distance measurements
+  List<FloorDistanceModel> _distances = [];
+
+  /// db/floor_plan_distances.sql hasn't been run yet.
+  bool _distancesMissing = false;
+  bool _showDistances = false;
+  String? _distanceFromId;
+  String? _distanceToId;
+
+  /// The row tapped in Check distance; its two nodes are highlighted.
+  String? _selectedDistanceId;
+
+  /// Measurements affected by the last saved move, marked in Check distance.
+  Set<String> _movedDistanceIds = const {};
+
+  // dragging nodes: positions in [_nodes] change straight away, and nothing
+  // is written until Save Moves
+  final _moveLog = NodeMoveLog();
+  int? _dragPointer;
+  String? _dragNodeId;
+  Offset _dragStartPos = Offset.zero;
+
+  /// From the pointer to the node's centre, so a node doesn't jump on grab.
+  Offset _dragGrabOffset = Offset.zero;
+
   // test route
   _RtTarget _routeFromTarget = _RtTarget.node;
   _RtTarget _routeToTarget = _RtTarget.roomFacility;
@@ -306,8 +360,7 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
   String? _routeFromLink; // "<id>|<table>"
   String? _routeToLink;
   List<String> _routePath = const [];
-  double _routeDistance = 0;
-  bool _routeIsMeters = false;
+  double _routeDistance = 0; // pixels
   String? _routeArrivingLabel;
 
   @override
@@ -352,37 +405,67 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
       List<RoomModel> rooms = [];
       List<FacilityModel> facilities = [];
       List<IndoorNodeModel> stairGroupNodes = [];
+      List<BuildingModel> allBuildings = [];
+      List<IndoorNodeModel> crossNodes = [];
+      // Secondary data: the editor still opens without it, but the admin
+      // must see what is missing instead of silently empty lists.
+      final failed = <String>[];
+      Future<void> tryLoad(String what, Future<void> Function() load) async {
+        try {
+          await load();
+        } catch (e) {
+          debugPrint('floor plan editor: $what failed to load: $e');
+          failed.add(what);
+        }
+      }
+
+      await tryLoad('cross-building links', () async {
+        crossNodes = await _repo.getCrossBuildingNodes();
+      });
+      var distances = <FloorDistanceModel>[];
+      var distancesMissing = false;
+      await tryLoad('distances', () async {
+        try {
+          distances = await _distanceRepo.getForFloor(widget.floorPlanId);
+        } on FloorDistancesMissing {
+          distancesMissing = true;
+        }
+      });
       final buildingPlans = <int, FloorPlanModel>{};
       final bid = plan.buildingId;
       if (bid != null) {
         for (final p in plans) {
           if (p.buildingId == bid && p.id != null) buildingPlans[p.id!] = p;
         }
-        try {
-          final all = await _buildingRepo.getAll();
+        await tryLoad('buildings', () async {
+          // Every building, for names; the cross-building picker narrows it.
+          final all = await _buildingRepo.getAll(status: ActiveFilter.all);
+          allBuildings = all;
           building = all.firstWhere((b) => b.id == bid,
               orElse: () => all.isEmpty
                   ? const BuildingModel(name: 'Building')
                   : all.first);
-        } catch (_) {}
-        try {
+        });
+        await tryLoad('outdoor entrances', () async {
           entrances = await _nodeRepo.getEntranceNodesForBuilding(bid);
-        } catch (_) {}
-        try {
+        });
+        await tryLoad('rooms', () async {
           rooms = await _roomRepo.getByBuilding(bid);
-        } catch (_) {}
-        try {
+        });
+        await tryLoad('facilities', () async {
           facilities = await _facilityRepo.getByBuilding(bid);
-        } catch (_) {}
-        try {
+        });
+        await tryLoad('stair links', () async {
           final all = await _repo.getIndoorNodesForBuilding(bid);
           stairGroupNodes = all
               .where((n) => (n.stairGroup?.isNotEmpty ?? false))
               .toList();
-        } catch (_) {}
+        });
       }
 
+      if (!mounted) return;
       setState(() {
+        _loadFailures = failed;
         _plan = plan;
         _building = building;
         _nodes = nodes;
@@ -394,12 +477,22 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
         _buildingPlans
           ..clear()
           ..addAll(buildingPlans);
+        _allBuildings = allBuildings;
+        _allPlans
+          ..clear()
+          ..addAll({for (final p in plans) if (p.id != null) p.id!: p});
+        _crossNodes = crossNodes;
+        _distances = distances;
+        _distancesMissing = distancesMissing;
         _loading = false;
       });
       final url = plan.imageUrl;
-      if (url != null && url.isNotEmpty) _resolveImage(url);
+      if (url != null && url.isNotEmpty && _imageSize == null) {
+        _resolveImage(url);
+      }
     } catch (e) {
       debugPrint('floor plan editor load failed: $e');
+      if (!mounted) return;
       setState(() {
         _error = e;
         _loading = false;
@@ -411,19 +504,35 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
     try {
       final nodes = await _repo.getIndoorNodes(widget.floorPlanId);
       final edges = await _repo.getIndoorEdges(widget.floorPlanId);
-      final bid = _plan?.buildingId;
-      final stairNodes = bid == null
-          ? _stairGroupNodes
-          : (await _repo.getIndoorNodesForBuilding(bid))
-              .where((n) => (n.stairGroup?.isNotEmpty ?? false))
-              .toList();
+      final crossNodes = await _repo.getCrossBuildingNodes();
+      if (!mounted) return;
       setState(() {
         _nodes = nodes;
         _edges = edges;
-        _stairGroupNodes = stairNodes;
+        _crossNodes = crossNodes;
       });
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _refresh);
+      return;
+    }
+    // Stair links are secondary: a failure shows in the banner (with Retry)
+    // without throwing away the nodes and edges refreshed above.
+    final bid = _plan?.buildingId;
+    if (bid == null) return;
+    const what = 'stair links';
+    try {
+      final all = await _repo.getIndoorNodesForBuilding(bid);
+      if (!mounted) return;
+      setState(() {
+        _stairGroupNodes = all
+            .where((n) => (n.stairGroup?.isNotEmpty ?? false))
+            .toList();
+        _loadFailures = [..._loadFailures.where((f) => f != what)];
+      });
+    } catch (e) {
+      debugPrint('floor plan editor: $what failed to refresh: $e');
+      if (!mounted) return;
+      setState(() => _loadFailures = {..._loadFailures, what}.toList());
     }
   }
 
@@ -468,75 +577,164 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
     return (a - b).distance;
   }
 
-  /// Converts a pixel position on the floor plan image to a real-world
-  /// GPS coordinate, bilinearly interpolated from the plan's four
-  /// georeferenced corners. Returns null if the plan isn't georeferenced.
-  LatLng? _pixelToLatLng(double? tapX, double? tapY) {
-    final plan = _plan;
-    final size = _imageSize;
-    if (plan == null ||
-        size == null ||
-        tapX == null ||
-        tapY == null ||
-        !plan.isGeoreferenced ||
-        plan.nwLat == null ||
-        plan.nwLng == null ||
-        plan.neLat == null ||
-        plan.neLng == null ||
-        plan.swLat == null ||
-        plan.swLng == null ||
-        plan.seLat == null ||
-        plan.seLng == null ||
-        size.width <= 0 ||
-        size.height <= 0) {
-      return null;
+  /// The floor's scale, or the estimate while it is not calibrated (see
+  /// [_scaleCalibrated]) — distances shown with it are marked as estimates.
+  double get _metersPerPixel =>
+      _plan?.effectiveMetersPerPixel ?? kDefaultMetersPerPixel;
+
+  bool get _scaleCalibrated => _plan?.isScaleCalibrated ?? false;
+
+  double _toMeters(double pixels) => pixels * _metersPerPixel;
+
+  /// Nodes linked to a deleted or inactive room/facility. [_rooms] and
+  /// [_facilities] hold the active rows; if either failed to load, every
+  /// link would look broken, so nothing is reported until they load.
+  List<IndoorNodeModel> get _danglingNodes {
+    if (_plan?.buildingId == null ||
+        _loadFailures.contains('rooms') ||
+        _loadFailures.contains('facilities')) {
+      return const [];
     }
-
-    final relX = (tapX / size.width).clamp(0.0, 1.0);
-    final relY = (tapY / size.height).clamp(0.0, 1.0);
-
-    final topLat = plan.nwLat! + relX * (plan.neLat! - plan.nwLat!);
-    final topLng = plan.nwLng! + relX * (plan.neLng! - plan.nwLng!);
-    final botLat = plan.swLat! + relX * (plan.seLat! - plan.swLat!);
-    final botLng = plan.swLng! + relX * (plan.seLng! - plan.swLng!);
-
-    final lat = topLat + relY * (botLat - topLat);
-    final lng = topLng + relY * (botLng - topLng);
-    return LatLng(lat, lng);
+    return danglingLinkedNodes(_nodes, _rooms, _facilities);
   }
 
-  /// Edge weight in meters (via [Distance]) when both endpoints have real
-  /// GPS coordinates (georeferenced floor plan); otherwise falls back to the
-  /// original pixel distance, unchanged from before georeferencing existed.
-  double _edgeWeight(String fromId, String toId) {
-    final from = _node(fromId);
-    final to = _node(toId);
-    if (from?.lat != null &&
-        from?.lng != null &&
-        to?.lat != null &&
-        to?.lng != null) {
-      return const Distance().as(
-        LengthUnit.Meter,
-        LatLng(from!.lat!, from.lng!),
-        LatLng(to!.lat!, to.lng!),
-      );
+  Future<void> _clearDanglingLinks() async {
+    final nodes = _danglingNodes;
+    final ok = await ConfirmDialog.show(
+      context,
+      title: 'Clear broken links',
+      verb: 'clear the room/facility link on',
+      itemName: '${nodes.length} '
+          '${nodes.length == 1 ? 'node' : 'nodes'}',
+      message: 'The rooms or facilities they point at are deleted or '
+          'inactive. The nodes stay on the floor plan.',
+      confirmLabel: 'Clear links',
+    );
+    if (!ok) return;
+    try {
+      await _repo.clearNodeLinks([for (final n in nodes) n.id]);
+      await _refresh();
+      if (mounted) context.showSuccess('Links cleared');
+    } catch (e) {
+      if (mounted) context.showError(e, onRetry: _clearDanglingLinks);
     }
-    final a = _posOf(fromId);
-    final b = _posOf(toId);
-    return (a != null && b != null) ? (a - b).distance : 1.0;
+  }
+
+  /// Length of an edge in image pixels. Computed from the two nodes' current
+  /// positions so routing stays correct even for edges saved by the old
+  /// georeferencing workflow (whose stored weight is in meters).
+  double _edgePixels(IndoorEdgeModel e) {
+    final d = _pixelDist(e.fromNode, e.toNode);
+    if (d > 0) return d;
+    return (e.weight != null && e.weight! > 0) ? e.weight! : 1.0;
+  }
+
+  // --- cross-building links ---------------------------------------------
+
+  /// Weight of the edge joining two cross-building nodes, in pixels.
+  static const double _crossBuildingEdgeWeight = 50;
+
+  String _buildingNameOf(int? id) {
+    for (final b in _allBuildings) {
+      if (b.id == id) return b.name;
+    }
+    return 'Building #$id';
+  }
+
+  /// "GET Building Floor 1".
+  String _placeOf(IndoorNodeModel n) {
+    final plan = n.floorPlanId == null ? null : _allPlans[n.floorPlanId];
+    final floor = plan?.floorNumber ?? n.floor;
+    return '${_buildingNameOf(n.buildingId ?? plan?.buildingId)} Floor $floor';
+  }
+
+  List<IndoorNodeModel> _crossPartners(IndoorNodeModel n) {
+    final ref = n.crossBuildingRef?.trim() ?? '';
+    if (ref.isEmpty) return const [];
+    return _crossNodes
+        .where((o) => o.id != n.id && o.crossBuildingRef?.trim() == ref)
+        .toList();
+  }
+
+  /// Tooltip/caption for a node's cross-building link; null if it has none.
+  String? _crossLinkCaption(IndoorNodeModel n) {
+    final ref = n.crossBuildingRef?.trim() ?? '';
+    if (ref.isEmpty) return null;
+    final partners = _crossPartners(n);
+    if (partners.isEmpty) return 'Ref $ref — not linked yet';
+    if (partners.length > 1) {
+      return 'Ref $ref is used by ${partners.length} other nodes — '
+          'make it unique';
+    }
+    return 'Connected to ${_placeOf(partners.first)}';
+  }
+
+  /// After a save: links the node to the other node sharing its
+  /// cross_building_ref with one two-way edge, and removes the edge to the
+  /// old partner if the ref was changed or cleared.
+  Future<void> _syncCrossBuildingLink(
+    IndoorNodeModel saved, {
+    IndoorNodeModel? previous,
+  }) async {
+    final ref = saved.crossBuildingRef?.trim() ?? '';
+    final oldRef = previous?.crossBuildingRef?.trim() ?? '';
+    try {
+      if (oldRef.isNotEmpty && oldRef != ref) {
+        final oldPartners =
+            await _repo.findCrossBuildingPartners(oldRef, excludeId: saved.id);
+        for (final p in oldPartners) {
+          await _repo.deleteEdgesBetween(saved.id, p.id);
+        }
+      }
+      if (ref.isEmpty) return;
+
+      final partners =
+          await _repo.findCrossBuildingPartners(ref, excludeId: saved.id);
+      if (!mounted) return;
+      if (partners.isEmpty) {
+        context.showInfo('Ref ID saved. Connect the other building node with '
+            'the same ID to complete the link');
+        return;
+      }
+      if (partners.length > 1) {
+        context.showError(
+            'Ref ID "$ref" is already used by ${partners.length} other nodes '
+            '(${partners.map((p) => p.id).join(', ')}). Use a unique ID per '
+            'connection — no edge was created.');
+        return;
+      }
+      final partner = partners.first;
+      final where = '${partner.name?.isNotEmpty == true ? partner.name : partner.id}'
+          ' in ${_placeOf(partner)}';
+      if (await _repo.edgeExistsBetween(saved.id, partner.id)) {
+        if (mounted) context.showSuccess('Already connected to $where');
+        return;
+      }
+      await _repo.createIndoorEdge(IndoorEdgeModel(
+        fromNode: saved.id,
+        toNode: partner.id,
+        floorPlanId: widget.floorPlanId,
+        weight: _crossBuildingEdgeWeight,
+        isTwoWay: true,
+      ));
+      if (mounted) context.showSuccess('Connected to $where');
+    } catch (e) {
+      if (mounted) {
+        context.showError(e,
+            onRetry: () => _syncCrossBuildingLink(saved, previous: previous));
+      }
+    }
   }
 
   // --- canvas tap ------------------------------------------------------
 
-  void _handleCanvasTap(Offset viewportPoint) {
-    final inverse = Matrix4.inverted(_transform.value);
-    final scene = MatrixUtils.transformPoint(inverse, viewportPoint);
+  /// A point in the viewer to image pixels.
+  Offset _toScene(Offset viewportPoint) => MatrixUtils.transformPoint(
+      Matrix4.inverted(_transform.value), viewportPoint);
 
-    if (_mode == _Mode.addNode) {
-      _openNodeDialog(x: scene.dx, y: scene.dy);
-      return;
-    }
-
+  /// The node under [scene], or null. Targets stay one size on screen at any
+  /// zoom.
+  IndoorNodeModel? _nodeAt(Offset scene) {
     final scale = _transform.value.getMaxScaleOnAxis();
     final s = scale <= 0 ? 1.0 : scale;
     IndoorNodeModel? hit;
@@ -551,6 +749,33 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
         hit = n;
       }
     }
+    return hit;
+  }
+
+  void _handleCanvasTap(Offset viewportPoint) {
+    if (_moving) return;
+    final scene = _toScene(viewportPoint);
+
+    if (_mode == _Mode.addNode) {
+      // The viewer lets the image be panned past its edges; only accept
+      // taps that land on the image so x/y are always valid pixels.
+      final size = _imageSize;
+      if (size == null ||
+          scene.dx < 0 ||
+          scene.dy < 0 ||
+          scene.dx > size.width ||
+          scene.dy > size.height) {
+        context.showError('Tap inside the floor plan image to place a node');
+        return;
+      }
+      _openNodeDialog(
+        x: scene.dx.roundToDouble(),
+        y: scene.dy.roundToDouble(),
+      );
+      return;
+    }
+
+    final hit = _nodeAt(scene);
     if (hit != null) {
       _onNodeTapped(hit);
       return;
@@ -567,6 +792,22 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
       if (node.id == _edgeFromId) return;
       setState(() => _edgeToId = node.id);
       await _promptAddEdge(_edgeFromId!, node.id);
+      return;
+    }
+    if (_mode == _Mode.addDistance) {
+      final from = _distanceFromId;
+      if (from == null) {
+        setState(() => _distanceFromId = node.id);
+        return;
+      }
+      final problem =
+          validateMeasurePair(from, node.id, _pairPixels(from, node.id));
+      if (problem != null) {
+        context.showError(problem);
+        return;
+      }
+      setState(() => _distanceToId = node.id);
+      await _promptAddDistance(from, node.id);
       return;
     }
     setState(() {
@@ -593,19 +834,16 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
         outdoorEntrances: _outdoorEntrances,
         rooms: _rooms,
         facilities: _facilities,
+        buildings: _allBuildings,
+        floorPlans: _allPlans.values.toList(),
       ),
     );
     if (result == null) return;
-    // Stamp real GPS coordinates onto the node when the floor plan has been
-    // georeferenced — used for lat/lng-based edge weights and future
-    // outdoor↔indoor distance calculations. x/y (pixel position) is still
-    // the source of truth for where the node is drawn on the image.
-    final latLng = _pixelToLatLng(result.x, result.y);
-    final toSave = latLng == null
-        ? result
-        : result.copyWith(lat: latLng.latitude, lng: latLng.longitude);
+    // x/y image pixels are the node's position; no GPS is derived.
+    final toSave = result;
     setState(() => _saving = true);
     try {
+      await _entranceRepo.checkIndoorSide(toSave);
       final IndoorNodeModel saved;
       if (existing == null) {
         saved = await _repo.createIndoorNode(toSave);
@@ -625,9 +863,13 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
         if (mounted) context.showSuccess('Node "${saved.id}" updated');
       }
       await _syncOutdoorLink(saved, previous: existing);
+      await _syncCrossBuildingLink(saved, previous: existing);
       await _refresh();
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) {
+        context.showError(e,
+            onRetry: () => _openNodeDialog(x: x, y: y, existing: existing));
+      }
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -639,16 +881,12 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
     IndoorNodeModel? previous,
   }) async {
     try {
-      final prevOut = previous?.outdoorNodeId;
-      final newOut = node.outdoorNodeId;
-      if (prevOut != null && prevOut != newOut) {
-        await _nodeRepo.setIndoorLink(prevOut, null);
-      }
-      if (newOut != null && newOut.isNotEmpty) {
-        await _nodeRepo.setIndoorLink(newOut, node.id);
-      }
+      await _entranceRepo.syncFromIndoor(node, previous: previous);
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) {
+        context.showError(e,
+            onRetry: () => _syncOutdoorLink(node, previous: previous));
+      }
     }
   }
 
@@ -660,11 +898,10 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
       message: 'Delete node ${node.id}? Connected edges will also be deleted.',
     );
     if (!ok) return;
+    final measured = measurementsTouching(_distances, {node.id}).length;
     try {
       await _repo.deleteIndoorNode(node.id);
-      if (node.outdoorNodeId != null && node.outdoorNodeId!.isNotEmpty) {
-        await _nodeRepo.setIndoorLink(node.outdoorNodeId!, null);
-      }
+      await _entranceRepo.clearLinksToIndoorNode(node.id);
       setState(() {
         _nodes = _nodes.where((n) => n.id != node.id).toList();
         _edges = _edges
@@ -672,9 +909,18 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
             .toList();
         if (_selectedNodeId == node.id) _selectedNodeId = null;
       });
-      if (mounted) context.showSuccess('Node "${node.id}" deleted');
+      if (!mounted) return;
+      context.showSuccess('Node "${node.id}" deleted');
+      // The database deleted its measurements with it (see
+      // db/floor_plan_distances.sql), which can change the scale.
+      if (measured > 0) {
+        await _syncDistances(
+            done: '$measured '
+                '${measured == 1 ? 'measurement' : 'measurements'} removed '
+                'with node ${node.id}');
+      }
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: () => _deleteNode(node));
     }
   }
 
@@ -692,7 +938,10 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
       });
       return;
     }
-    final weight = _edgeWeight(fromId, toId);
+    // Weight is stored in pixels: it stays valid if meters-per-pixel is
+    // changed later (meters = weight * meters_per_pixel).
+    final px = _pixelDist(fromId, toId);
+    final weight = px > 0 ? px : 1.0;
     try {
       final edge = await _repo.createIndoorEdge(IndoorEdgeModel(
         fromNode: fromId,
@@ -709,7 +958,9 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
       });
       if (mounted) context.showSuccess('Edge $fromId → $toId added');
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) {
+        context.showError(e, onRetry: () => _promptAddEdge(fromId, toId));
+      }
     }
   }
 
@@ -726,7 +977,303 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
       setState(() => _edges = _edges.where((e) => e.id != edge.id).toList());
       if (mounted) context.showSuccess('Edge deleted');
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: () => _deleteEdge(edge));
+    }
+  }
+
+  // --- distance measurements ---------------------------------------
+
+  double? _pairPixels(String a, String b) =>
+      nodePixelDistance(_node(a), _node(b));
+
+  String _nodeName(String id) => nodeDisplayName(_node(id), id);
+
+  String _pairName(FloorDistanceModel m) =>
+      '${_nodeName(m.nodeAId)} ↔ ${_nodeName(m.nodeBId)}';
+
+  /// From [_distances] and the nodes as they are now, drags included.
+  FloorScaleSummary get _scaleSummary => computeFloorScale(_distances, _nodes);
+
+  FloorDistanceModel? get _selectedDistance {
+    for (final m in _distances) {
+      if (m.id == _selectedDistanceId) return m;
+    }
+    return null;
+  }
+
+  void _toggleAddDistance() {
+    if (_distancesMissing) {
+      context.showError(kFloorDistancesMissingMessage);
+      return;
+    }
+    setState(() {
+      _mode = _mode == _Mode.addDistance ? _Mode.none : _Mode.addDistance;
+      _edgeFromId = null;
+      _edgeToId = null;
+      _distanceFromId = null;
+      _distanceToId = null;
+    });
+  }
+
+  Future<void> _promptAddDistance(String a, String b) async {
+    final meters = await showDialog<double>(
+      context: context,
+      builder: (_) => MeasurementDialog(
+        nameA: _nodeName(a),
+        nameB: _nodeName(b),
+        pixels: _pairPixels(a, b)!,
+      ),
+    );
+    if (!mounted) return;
+    setState(() {
+      _distanceFromId = null;
+      _distanceToId = null;
+    });
+    if (meters == null) return;
+    await _changeDistance(
+      () => _distanceRepo.add(
+        floorPlanId: widget.floorPlanId,
+        nodeAId: a,
+        nodeBId: b,
+        realMeters: meters,
+      ),
+      'Distance saved',
+    );
+  }
+
+  Future<void> _editDistance(MeasurementLine line) async {
+    final m = line.measurement;
+    final pixels = line.pixels;
+    if (pixels == null) {
+      context.showError('One of these nodes has no position on the plan');
+      return;
+    }
+    final meters = await showDialog<double>(
+      context: context,
+      builder: (_) => MeasurementDialog(
+        nameA: _nodeName(m.nodeAId),
+        nameB: _nodeName(m.nodeBId),
+        pixels: pixels,
+        initialMeters: m.realMeters,
+      ),
+    );
+    if (meters == null || meters == m.realMeters) return;
+    await _changeDistance(
+        () => _distanceRepo.setMeters(m.id, meters), 'Distance updated');
+  }
+
+  Future<void> _ignoreDistance(MeasurementLine line, bool ignored) =>
+      _changeDistance(
+        () => _distanceRepo.setIgnored(line.measurement.id, ignored),
+        ignored ? 'Measurement ignored' : 'Measurement counted again',
+      );
+
+  Future<void> _deleteDistance(MeasurementLine line) async {
+    final ok = await ConfirmDialog.show(
+      context,
+      title: 'Delete distance',
+      itemName: _pairName(line.measurement),
+    );
+    if (!ok) return;
+    await _changeDistance(
+      () => _distanceRepo.delete(line.measurement.id),
+      'Distance deleted',
+    );
+  }
+
+  /// Runs [write], then brings the list and the floor's scale up to date.
+  Future<void> _changeDistance(
+    Future<void> Function() write,
+    String done,
+  ) async {
+    setState(() => _saving = true);
+    try {
+      await write();
+      await _syncDistances(done: done);
+    } on FloorDistancesMissing {
+      if (mounted) {
+        setState(() => _distancesMissing = true);
+        context.showError(kFloorDistancesMissingMessage);
+      }
+    } catch (e) {
+      if (mounted) {
+        context.showError(e, onRetry: () => _changeDistance(write, done));
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  /// Reloads the measurements, saves the scale they give with the usual
+  /// save-and-confirm, and says what happened. [done] starts the message.
+  /// The list updates even if the scale can't be saved: the panel then shows
+  /// the mismatch, with a button to try again.
+  Future<void> _syncDistances({required String done}) async {
+    try {
+      final distances = await _distanceRepo.getForFloor(widget.floorPlanId);
+      if (!mounted) return;
+      setState(() {
+        _distances = distances;
+        _distancesMissing = false;
+      });
+      await _saveMeasuredScale(done: done);
+    } on FloorDistancesMissing {
+      if (mounted) setState(() => _distancesMissing = true);
+    } catch (e) {
+      if (mounted) {
+        context.showError(e, onRetry: () => _syncDistances(done: done));
+      }
+    }
+  }
+
+  Future<void> _saveMeasuredScale({String done = 'Scale saved'}) async {
+    final plan = _plan;
+    if (plan == null) return;
+    final summary = _scaleSummary;
+    final saved = await _distanceRepo.applyScale(plan, summary);
+    if (!mounted) return;
+    setState(() => _plan = saved);
+    if (summary.metersPerPixel == null) {
+      context.showInfo('$done. ${unchangedScaleNote(saved)}');
+      return;
+    }
+    final message = '$done. Scale: ${saved.scaleLabel}';
+    final warnings = summary.warnings;
+    if (warnings.isEmpty) {
+      context.showSuccess(message);
+    } else {
+      context.showWarning('$message. ${warnings.join(' ')}');
+    }
+  }
+
+  Future<void> _retryMeasuredScale() async {
+    try {
+      await _saveMeasuredScale();
+    } catch (e) {
+      if (mounted) context.showError(e, onRetry: _retryMeasuredScale);
+    }
+  }
+
+  // --- moving nodes -------------------------------------------------
+
+  bool get _moving => _mode == _Mode.moveNodes;
+
+  void _enterMoveMode() {
+    // A drawn route would no longer match the nodes it was found on.
+    _clearRoute(resetInputs: false);
+    setState(() {
+      _mode = _Mode.moveNodes;
+      _edgeFromId = null;
+      _edgeToId = null;
+      _distanceFromId = null;
+      _distanceToId = null;
+    });
+  }
+
+  void _placeNode(String id, double x, double y) {
+    _nodes = [
+      for (final n in _nodes)
+        if (n.id == id) n.copyWith(x: x, y: y) else n,
+    ];
+  }
+
+  void _onDragStart(PointerDownEvent event) {
+    if (!_moving || _saving || _dragPointer != null) return;
+    if (event.buttons != kPrimaryButton) return;
+    final scene = _toScene(event.localPosition);
+    final node = _nodeAt(scene);
+    if (node == null) return;
+    setState(() {
+      _dragPointer = event.pointer;
+      _dragNodeId = node.id;
+      _dragStartPos = Offset(node.x!, node.y!);
+      _dragGrabOffset = _dragStartPos - scene;
+      _selectedNodeId = node.id;
+    });
+  }
+
+  void _onDragUpdate(PointerMoveEvent event) {
+    final id = _dragNodeId;
+    final size = _imageSize;
+    if (event.pointer != _dragPointer || id == null || size == null) return;
+    final at = _toScene(event.localPosition) + _dragGrabOffset;
+    // Whole pixels on the image, like a placed node.
+    final x = at.dx.clamp(0.0, size.width).roundToDouble();
+    final y = at.dy.clamp(0.0, size.height).roundToDouble();
+    setState(() => _placeNode(id, x, y));
+  }
+
+  void _onDragEnd(PointerEvent event) {
+    final id = _dragNodeId;
+    if (event.pointer != _dragPointer || id == null) return;
+    final end = _posOf(id);
+    setState(() {
+      if (end != null && end != _dragStartPos) {
+        _moveLog.add(NodeMove(
+          id: id,
+          fromX: _dragStartPos.dx,
+          fromY: _dragStartPos.dy,
+          toX: end.dx,
+          toY: end.dy,
+        ));
+      }
+      _dragPointer = null;
+      _dragNodeId = null;
+    });
+  }
+
+  void _undoMove() {
+    final move = _moveLog.undo();
+    if (move == null) return;
+    setState(() => _placeNode(move.id, move.fromX, move.fromY));
+  }
+
+  void _cancelMoves() {
+    setState(() {
+      for (var m = _moveLog.undo(); m != null; m = _moveLog.undo()) {
+        _placeNode(m.id, m.fromX, m.fromY);
+      }
+      _mode = _Mode.none;
+    });
+  }
+
+  /// Writes the dragged positions and the connected edges' new lengths, then
+  /// recalculates the scale and says which measurements that touched.
+  Future<void> _saveMoves() async {
+    final moves = _moveLog.netMoves;
+    if (moves.isEmpty) {
+      _cancelMoves();
+      return;
+    }
+    final movedIds = {for (final m in moves) m.id};
+    final lengths = edgeLengthChanges(_edges, _nodes, movedIds);
+    final affected = measurementsTouching(_distances, movedIds);
+    setState(() => _saving = true);
+    try {
+      await _repo.saveNodeMoves(moves, lengths);
+      if (!mounted) return;
+      setState(() {
+        _moveLog.clear();
+        _mode = _Mode.none;
+        _movedDistanceIds = {for (final m in affected) m.id};
+        if (affected.isNotEmpty) _showDistances = true;
+      });
+      await _refresh();
+      if (!mounted) return;
+      final moved = '${moves.length} ${moves.length == 1 ? 'node' : 'nodes'} '
+          'moved, ${lengths.length} edge '
+          '${lengths.length == 1 ? 'length' : 'lengths'} updated';
+      if (affected.isEmpty) {
+        context.showSuccess(moved);
+      } else {
+        await _syncDistances(
+            done: '$moved. Measurements affected: '
+                '${affected.map(_pairName).join(', ')}');
+      }
+    } catch (e) {
+      if (mounted) context.showError(e, onRetry: _saveMoves);
+    } finally {
+      if (mounted) setState(() => _saving = false);
     }
   }
 
@@ -746,9 +1293,7 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
 
     for (final e in _edges) {
       if (!navIds.contains(e.fromNode) || !navIds.contains(e.toNode)) continue;
-      final w = (e.weight != null && e.weight! > 0)
-          ? e.weight!
-          : _pixelDist(e.fromNode, e.toNode);
+      final w = _edgePixels(e);
       add(e.fromNode, e.toNode, w);
       if (e.isTwoWay) add(e.toNode, e.fromNode, w);
     }
@@ -800,48 +1345,25 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
         .toList();
   }
 
-  /// True when every consecutive pair of nodes along [path] has real GPS
-  /// coordinates, so the whole route can be measured in meters.
-  bool _pathIsGeoreferenced(List<String> path) {
-    for (var i = 1; i < path.length; i++) {
-      final a = _node(path[i - 1]);
-      final b = _node(path[i]);
-      if (a?.lat == null || a?.lng == null || b?.lat == null || b?.lng == null) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  double _segmentMeters(String from, String to) {
-    final a = _node(from);
-    final b = _node(to);
-    return const Distance()
-        .as(LengthUnit.Meter, LatLng(a!.lat!, a.lng!), LatLng(b!.lat!, b.lng!));
-  }
-
-  ({List<String> path, double dist, bool isMeters})? _bestRoutes(
+  /// Shortest route over every start/goal pair; distance is in pixels.
+  ({List<String> path, double dist})? _bestRoutes(
     List<String> starts,
     List<String> goals,
   ) {
-    ({List<String> path, double d, bool m})? best;
+    ({List<String> path, double dist})? best;
     for (final s in starts) {
       for (final g in goals) {
         if (s == g) continue;
         final path = _dijkstra(s, g);
         if (path == null || path.length < 2) continue;
-        final isMeters = _pathIsGeoreferenced(path);
         var d = 0.0;
         for (var i = 1; i < path.length; i++) {
-          d += isMeters
-              ? _segmentMeters(path[i - 1], path[i])
-              : _pixelDist(path[i - 1], path[i]);
+          d += _pixelDist(path[i - 1], path[i]);
         }
-        if (best == null || d < best.d) best = (path: path, d: d, m: isMeters);
+        if (best == null || d < best.dist) best = (path: path, dist: d);
       }
     }
-    if (best == null) return null;
-    return (path: best.path, dist: best.d, isMeters: best.m);
+    return best;
   }
 
   void _findRoute() {
@@ -895,7 +1417,6 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
     setState(() {
       _routePath = best.path;
       _routeDistance = best.dist;
-      _routeIsMeters = best.isMeters;
       _routeArrivingLabel = arriving;
     });
   }
@@ -904,7 +1425,6 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
     setState(() {
       _routePath = const [];
       _routeDistance = 0;
-      _routeIsMeters = false;
       _routeArrivingLabel = null;
       if (resetInputs) {
         _routeFromNodeId = null;
@@ -923,6 +1443,12 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
         return _edgeFromId == null
             ? 'Tap FROM node then tap TO node on the floor plan'
             : 'Now tap the TO node';
+      case _Mode.addDistance:
+        return _distanceFromId == null
+            ? 'Tap the first node to measure'
+            : 'Now tap the second node. It needs no edge to the first';
+      case _Mode.moveNodes:
+        return 'Drag a node to move it. Nothing is saved until Save Moves';
       case _Mode.none:
         return '';
     }
@@ -936,9 +1462,23 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _topBar(),
-        if (!_loading && _error == null && _plan?.isGeoreferenced == false)
-          _georeferenceWarningBanner(),
         const SizedBox(height: 12),
+        if (_error == null && !_loading && _loadFailures.isNotEmpty)
+          ErrorBanner(
+            message: 'Could not load ${_loadFailures.join(', ')}. '
+                'Those lists are empty until this loads.',
+            onRetry: _load,
+          ),
+        if (_error == null && !_loading && _danglingNodes.isNotEmpty)
+          ErrorBanner(
+            message: '${_danglingNodes.length} '
+                '${_danglingNodes.length == 1 ? 'node links' : 'nodes link'} '
+                'to a deleted or inactive room/facility: '
+                '${_danglingNodes.take(5).map((n) => n.name ?? n.id).join(', ')}'
+                '${_danglingNodes.length > 5 ? ', …' : ''}.',
+            retryLabel: 'Clear links',
+            onRetry: _clearDanglingLinks,
+          ),
         Expanded(
           child: _error != null
               ? _errorView()
@@ -950,6 +1490,10 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
                         SizedBox(width: 300, child: _leftPanel()),
                         const SizedBox(width: 16),
                         Expanded(child: _canvasPanel()),
+                        if (_showDistances && _plan != null) ...[
+                          const SizedBox(width: 16),
+                          SizedBox(width: 340, child: _distancePanel()),
+                        ],
                       ],
                     ),
         ),
@@ -957,9 +1501,34 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
     );
   }
 
+  Widget _distancePanel() {
+    return FloorDistancePanel(
+      plan: _plan!,
+      summary: _scaleSummary,
+      edges: edgeDistanceLines(_edges, _nodes, _metersPerPixel),
+      nodes: _nodes,
+      tableMissing: _distancesMissing,
+      busy: _saving || _moving,
+      selectedId: _selectedDistanceId,
+      movedIds: _movedDistanceIds,
+      onClose: () => setState(() {
+        _showDistances = false;
+        _selectedDistanceId = null;
+      }),
+      onSaveScale: _retryMeasuredScale,
+      onSelect: (line) => setState(() {
+        final id = line.measurement.id;
+        _selectedDistanceId = _selectedDistanceId == id ? null : id;
+      }),
+      onEdit: _editDistance,
+      onDelete: _deleteDistance,
+      onIgnore: _ignoreDistance,
+    );
+  }
+
   Widget _topBar() {
     final title = [
-      _building?.name ?? 'Floor Plan',
+      _building == null ? 'Floor Plan' : buildingOptionLabel(_building!),
       _plan?.floorName ?? (_plan?.floorNumber != null
           ? 'Floor ${_plan!.floorNumber}'
           : ''),
@@ -967,7 +1536,7 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
     return Row(
       children: [
         IconButton(
-          onPressed: () => context.go('/floor-plans'),
+          onPressed: _moving ? null : () => context.go('/floor-plans'),
           icon: const Icon(Icons.arrow_back),
         ),
         Expanded(
@@ -976,8 +1545,22 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
                   fontSize: 18, fontWeight: FontWeight.bold),
               overflow: TextOverflow.ellipsis),
         ),
+        if (_plan != null) ...[
+          OutlinedButton.icon(
+            onPressed: _saving || _moving ? null : _editScale,
+            icon: Icon(
+                _scaleCalibrated ? Icons.straighten : Icons.warning_amber,
+                size: 16),
+            label: Text('Scale: ${_plan!.scaleLabel}'),
+            style: _scaleCalibrated
+                ? null
+                : OutlinedButton.styleFrom(
+                    foregroundColor: AppColors.errorRed),
+          ),
+          const SizedBox(width: 8),
+        ],
         ElevatedButton.icon(
-          onPressed: _saving ? null : _load,
+          onPressed: _saving || _moving ? null : _load,
           icon: _saving
               ? const SizedBox(
                   width: 14,
@@ -991,46 +1574,33 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
     );
   }
 
-  Widget _georeferenceWarningBanner() {
+  /// Edits this floor plan's meters-per-pixel scale. Edge weights are stored
+  /// in pixels, so changing the scale never requires re-saving edges.
+  Future<void> _editScale() async {
     final plan = _plan;
-    return InkWell(
-      onTap: plan == null
-          ? null
-          : () => context.go('/floor-plans/georeference', extra: {
-                'building': _building ??
-                    BuildingModel(id: plan.buildingId, name: 'Building'),
-                'floorNumber': plan.floorNumber ?? 1,
-                'floorLabel':
-                    plan.floorName ?? 'Floor ${plan.floorNumber ?? 1}',
-                'imageFile': null,
-                'existingFloorPlan': plan,
-              }),
-      child: Container(
-        margin: const EdgeInsets.only(top: 10),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: AppColors.warningAmber.withValues(alpha: 0.15),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: AppColors.warningAmber),
-        ),
-        child: Row(
-          children: [
-            const Icon(Icons.warning_amber_rounded,
-                size: 18, color: AppColors.warningAmber),
-            const SizedBox(width: 10),
-            const Expanded(
-              child: Text(
-                'This floor plan is not georeferenced. Nodes will be saved '
-                'without GPS coordinates. Tap here to georeference first.',
-                style: TextStyle(fontSize: 12, color: _cCharcoal),
-              ),
-            ),
-            const Icon(Icons.chevron_right,
-                size: 18, color: AppColors.warningAmber),
-          ],
-        ),
-      ),
+    if (plan == null) return;
+    final value = await showDialog<double>(
+      context: context,
+      builder: (_) => _ScaleDialog(initial: plan.metersPerPixel),
     );
+    if (value == null || value == plan.metersPerPixel) return;
+    setState(() => _saving = true);
+    try {
+      final saved = await _repo.saveScale(plan.id!, value);
+      if (!mounted) return;
+      setState(() => _plan = saved);
+      if (saved.isScaleCalibrated) {
+        context.showSuccess('Scale saved and confirmed: ${saved.scaleLabel}');
+      } else {
+        context.showWarning(
+            'Saved ${saved.scaleLabel}. That is still the default estimate — '
+            'measure a known distance to calibrate this floor.');
+      }
+    } catch (e) {
+      if (mounted) context.showError(e, onRetry: _editScale);
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
   }
 
   Widget _errorView() {
@@ -1056,14 +1626,9 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
   // --- left panel --------------------------------------------
 
   Widget _leftPanel() {
-    return Container(
-      decoration: BoxDecoration(
-        color: AppColors.cardWhite,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: AppColors.border),
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: Column(
+    if (_moving) return _panelBox(_moveTools());
+    return _panelBox(
+      Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
@@ -1081,8 +1646,95 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
               _Tab.route => _routeTab(),
             },
           ),
+          const Divider(height: 1),
+          _distanceTools(),
         ],
       ),
+    );
+  }
+
+  /// The sidebar's last section, under every tab.
+  Widget _distanceTools() {
+    return Padding(
+      padding: const EdgeInsets.all(10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _maroonButton(
+            _mode == _Mode.addDistance ? 'Cancel Add Distance' : 'Add distance',
+            _toggleAddDistance,
+            on: _mode == _Mode.addDistance,
+          ),
+          const SizedBox(height: 8),
+          _maroonButton(
+            'Check distance',
+            () => setState(() => _showDistances = !_showDistances),
+            on: _showDistances,
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Replaces the tabs while moving, so nothing else can reload or save the
+  /// nodes with drags still pending.
+  Widget _moveTools() {
+    final moves = _moveLog.netMoves;
+    final affected =
+        measurementsTouching(_distances, {for (final m in moves) m.id});
+    final count = moves.length;
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        const Text('Move Nodes',
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 6),
+        const Text(
+          'Drag a node to its new position. Connected edges are measured '
+          'again when you save.',
+          style: TextStyle(fontSize: 11, color: AppColors.textSecondary),
+        ),
+        const SizedBox(height: 12),
+        Text('$count ${count == 1 ? 'node' : 'nodes'} moved, not saved yet',
+            style: const TextStyle(fontSize: 12)),
+        const SizedBox(height: 12),
+        _maroonButton('Save Moves', _saveMoves),
+        const SizedBox(height: 8),
+        OutlinedButton(
+          onPressed: _moveLog.isEmpty || _saving ? null : _undoMove,
+          child: const Text('Undo'),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton(
+          onPressed: _saving ? null : _cancelMoves,
+          child: const Text('Cancel'),
+        ),
+        if (affected.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          const Text('Measurements affected',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 4),
+          for (final m in affected)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(_pairName(m), style: const TextStyle(fontSize: 11)),
+            ),
+        ],
+      ],
+    );
+  }
+
+  Widget _panelBox(Widget child) {
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.cardWhite,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.border),
+      ),
+      clipBehavior: Clip.antiAlias,
+      // The list tiles below paint on the nearest Material, and this box's
+      // colour would hide that.
+      child: Material(type: MaterialType.transparency, child: child),
     );
   }
 
@@ -1157,11 +1809,15 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
                 _mode == _Mode.addNode ? 'Cancel Add Node' : 'Add Node',
                 () => setState(() {
                   _mode = _mode == _Mode.addNode ? _Mode.none : _Mode.addNode;
+                  _distanceFromId = null;
+                  _distanceToId = null;
                   _edgeFromId = null;
                   _edgeToId = null;
                 }),
                 on: _mode == _Mode.addNode,
               ),
+              const SizedBox(height: 8),
+              _maroonButton('Move Nodes', _enterMoveMode),
               const SizedBox(height: 8),
               SegmentedButton<_NavFilter>(
                 showSelectedIcon: false,
@@ -1203,6 +1859,7 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
                   rooms: _rooms,
                   facilities: _facilities,
                   saving: _saving,
+                  crossLinkCaption: _crossLinkCaption(_node(_selectedNodeId)!),
                   onDeselect: () =>
                       setState(() => _selectedNodeId = null),
                   onSaveEntrance: _saveEntranceLink,
@@ -1252,7 +1909,13 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
       });
       if (mounted) context.showSuccess('Node "${saved.id}" saved');
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) {
+        context.showError(
+          e,
+          onRetry: () => _saveEntranceLink(
+              node, linkedRoomId, linkedTable, entranceLabel),
+        );
+      }
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -1513,6 +2176,8 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
             _mode == _Mode.addEdge ? 'Cancel Add Edge' : 'Add Edge',
             () => setState(() {
               _mode = _mode == _Mode.addEdge ? _Mode.none : _Mode.addEdge;
+              _distanceFromId = null;
+              _distanceToId = null;
               _edgeFromId = null;
               _edgeToId = null;
             }),
@@ -1530,16 +2195,17 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
                   separatorBuilder: (_, _) => const Divider(height: 1),
                   itemBuilder: (context, i) {
                     final e = list[i];
-                    final dist = (e.weight != null && e.weight! > 0)
-                        ? e.weight!
-                        : _pixelDist(e.fromNode, e.toNode);
+                    final px = _edgePixels(e);
                     return ListTile(
                       dense: true,
                       title: Text('${e.fromNode}  →  ${e.toNode}',
                           style: const TextStyle(fontSize: 12)),
                       subtitle: Row(
                         children: [
-                          Text('${dist.toStringAsFixed(0)} px',
+                          Text(
+                              '${_scaleCalibrated ? '' : '~'}'
+                              '${_toMeters(px).toStringAsFixed(1)} m · '
+                              '${px.toStringAsFixed(0)} px',
                               style: const TextStyle(
                                   fontSize: 10,
                                   color: AppColors.textSecondary)),
@@ -1577,7 +2243,8 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
   }
 
   Widget _routeTab() {
-    final walkSeconds = _routeIsMeters ? (_routeDistance / 1.4) : 0.0;
+    final routeMeters = _toMeters(_routeDistance);
+    final walkSeconds = routeMeters / 1.4;
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(12),
@@ -1624,25 +2291,27 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
                               fontWeight: FontWeight.bold, fontSize: 12)),
                     ),
                   Text(
-                    _routeIsMeters
-                        ? 'Distance: ${_routeDistance.toStringAsFixed(1)} meters'
-                        : 'Distance: ${_routeDistance.toStringAsFixed(0)} px',
+                    'Distance: ${routeMeters.toStringAsFixed(1)} m',
                     style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
-                  const SizedBox(height: 2),
-                  if (_routeIsMeters)
-                    Text(
-                      'Estimated time: ~${walkSeconds.ceil()} seconds walk',
-                      style: const TextStyle(fontSize: 12),
-                    )
-                  else
+                  Text(
+                    '${_routeDistance.toStringAsFixed(0)} px × '
+                    '$_metersPerPixel m/px',
+                    style: const TextStyle(
+                        fontSize: 11, color: AppColors.textSecondary),
+                  ),
+                  if (!_scaleCalibrated)
                     const Text(
-                      '(Georeference floor plan for real distances)',
-                      style: TextStyle(
-                          fontSize: 11,
-                          fontStyle: FontStyle.italic,
-                          color: AppColors.warningAmber),
+                      'Scale not calibrated — meters and time are '
+                      'estimates using 0.05 m/px.',
+                      style:
+                          TextStyle(fontSize: 11, color: AppColors.errorRed),
                     ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'Estimated time: ~${walkSeconds.ceil()} seconds walk',
+                    style: const TextStyle(fontSize: 12),
+                  ),
                   const SizedBox(height: 2),
                   Text('Waypoints: ${_routePath.length} nodes',
                       style: const TextStyle(fontSize: 12)),
@@ -1781,6 +2450,13 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
     );
   }
 
+  /// Hover tooltip ("Connected to GET Building Floor 1") on linked nodes.
+  Widget _withCrossLinkTooltip(IndoorNodeModel n, Widget child) {
+    final caption = _crossLinkCaption(n);
+    if (caption == null) return child;
+    return Tooltip(message: caption, child: child);
+  }
+
   Widget _canvas() {
     final url = _plan?.imageUrl;
     if (url == null || url.isEmpty) {
@@ -1791,8 +2467,16 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
     }
     final size = _imageSize!;
     final byId = {for (final n in _nodes) n.id: n};
+    final measured = _selectedDistance;
+    Color? highlightOf(String id) => id == _edgeFromId || id == _distanceFromId
+        ? _cGreen
+        : id == _edgeToId || id == _distanceToId
+            ? AppColors.errorRed
+            : id == measured?.nodeAId || id == measured?.nodeBId
+                ? _cRoute
+                : null;
 
-    return GestureDetector(
+    final viewer = GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTapUp: (d) => _handleCanvasTap(d.localPosition),
       child: InteractiveViewer(
@@ -1801,6 +2485,7 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
         maxScale: 5.0,
         boundaryMargin: const EdgeInsets.all(100),
         constrained: false,
+        panEnabled: _dragNodeId == null,
         child: SizedBox(
           width: size.width,
           height: size.height,
@@ -1808,7 +2493,9 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
             clipBehavior: Clip.none,
             children: [
               Positioned.fill(
-                child: CachedNetworkImage(imageUrl: url, fit: BoxFit.fill),
+                child: widget.testImageSize != null
+                    ? const SizedBox.shrink()
+                    : CachedNetworkImage(imageUrl: url, fit: BoxFit.fill),
               ),
               Positioned.fill(
                 child: CustomPaint(
@@ -1816,6 +2503,8 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
                     byId: byId,
                     edges: _edges,
                     routePath: _routePath,
+                    measureFrom: measured?.nodeAId,
+                    measureTo: measured?.nodeBId,
                   ),
                 ),
               ),
@@ -1827,14 +2516,15 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
                     top: n.y! - 12,
                     width: 24,
                     height: 24,
-                    child: _NodeDot(
-                      color: labelColor(n.label),
-                      selected: n.id == _selectedNodeId,
-                      highlight: n.id == _edgeFromId
-                          ? _cGreen
-                          : n.id == _edgeToId
-                              ? AppColors.errorRed
-                              : null,
+                    child: _withCrossLinkTooltip(
+                      n,
+                      _NodeDot(
+                        color: labelColor(n.label),
+                        selected: n.id == _selectedNodeId,
+                        crossBuilding:
+                            (n.crossBuildingRef?.trim() ?? '').isNotEmpty,
+                        highlight: highlightOf(n.id),
+                      ),
                     ),
                   ),
               // Navigation node id labels — only when zoomed in past 1.5x.
@@ -1878,7 +2568,7 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
                     top: n.y!,
                     child: FractionalTranslation(
                       translation: const Offset(-0.5, -0.5),
-                      child: _infoLabel(n),
+                      child: _infoLabel(n, highlightOf(n.id)),
                     ),
                   ),
             ],
@@ -1886,14 +2576,24 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
         ),
       ),
     );
+    // A Listener sees the pointer outside the gesture arena, where the
+    // viewer would win the drag and pan the plan instead. A press away from
+    // any node still pans.
+    return Listener(
+      onPointerDown: _onDragStart,
+      onPointerMove: _onDragUpdate,
+      onPointerUp: _onDragEnd,
+      onPointerCancel: _onDragEnd,
+      child: viewer,
+    );
   }
 
-  Widget _infoLabel(IndoorNodeModel n) {
+  Widget _infoLabel(IndoorNodeModel n, Color? highlight) {
     final color = infoTextColor(n.label);
     final num = n.roomNumber?.trim() ?? '';
     final name = n.roomName?.trim() ?? '';
     final fs = _dynamicFontSize; // base 16 → clamp(11, 26)
-    final selected = n.id == _selectedNodeId;
+    final ring = highlight ?? (n.id == _selectedNodeId ? _cGold : null);
 
     // Text priority: room number → room name → nicely-formatted label.
     final text = num.isNotEmpty
@@ -1910,7 +2610,7 @@ class _FloorPlanEditorScreenState extends State<FloorPlanEditorScreen> {
         boxShadow: const [
           BoxShadow(color: Colors.black26, blurRadius: 3),
         ],
-        border: selected ? Border.all(color: _cGold, width: 1.5) : null,
+        border: ring == null ? null : Border.all(color: ring, width: 1.5),
       ),
       child: Text(
         text,
@@ -1928,23 +2628,33 @@ class _NodeDot extends StatelessWidget {
   final bool selected;
   final Color? highlight;
 
+  /// Linked to another building — drawn larger with an orange ring.
+  final bool crossBuilding;
+
   const _NodeDot({
     required this.color,
     required this.selected,
     this.highlight,
+    this.crossBuilding = false,
   });
 
   @override
   Widget build(BuildContext context) {
-    final ring = highlight ?? (selected ? _cGold : Colors.white);
-    final ringW = highlight != null || selected ? 3.0 : 1.5;
-    // alignment: center — the 24x24 box is centred on (x, y), and the 10px
+    final ring = highlight ??
+        (selected
+            ? _cGold
+            : crossBuilding
+                ? AppColors.crossBuildingOrange
+                : Colors.white);
+    final ringW = highlight != null || selected || crossBuilding ? 3.0 : 1.5;
+    final size = crossBuilding ? 16.0 : 10.0;
+    // alignment: center — the 24x24 box is centred on (x, y), and the
     // circle is centred in the box, so its centre sits on the coordinate.
     return Align(
       alignment: Alignment.center,
       child: Container(
-        width: 10,
-        height: 10,
+        width: size,
+        height: size,
         decoration: BoxDecoration(
           color: color,
           shape: BoxShape.circle,
@@ -1962,10 +2672,16 @@ class _IndoorEdgePainter extends CustomPainter {
   final List<IndoorEdgeModel> edges;
   final List<String> routePath;
 
+  /// The measurement picked in Check distance, drawn as a straight line.
+  final String? measureFrom;
+  final String? measureTo;
+
   _IndoorEdgePainter({
     required this.byId,
     required this.edges,
     required this.routePath,
+    this.measureFrom,
+    this.measureTo,
   });
 
   @override
@@ -2017,6 +2733,20 @@ class _IndoorEdgePainter extends CustomPainter {
       }
       canvas.drawPath(path, route);
     }
+
+    final from = measureFrom == null ? null : p(measureFrom!);
+    final to = measureTo == null ? null : p(measureTo!);
+    if (from != null && to != null) {
+      _dashed(
+        canvas,
+        from,
+        to,
+        Paint()
+          ..color = _cRoute
+          ..strokeWidth = 3
+          ..style = PaintingStyle.stroke,
+      );
+    }
   }
 
   void _dashed(Canvas canvas, Offset a, Offset b, Paint paint) {
@@ -2038,7 +2768,9 @@ class _IndoorEdgePainter extends CustomPainter {
   bool shouldRepaint(covariant _IndoorEdgePainter old) =>
       old.edges != edges ||
       old.byId != byId ||
-      old.routePath != routePath;
+      old.routePath != routePath ||
+      old.measureFrom != measureFrom ||
+      old.measureTo != measureTo;
 }
 
 // --- legend -----------------------------------------------------------
@@ -2087,6 +2819,23 @@ class _Legend extends StatelessWidget {
             dotItem(_cMaroon, 'Stairs'),
             dotItem(const Color(0xFF185FA5), 'Elevator'),
             dotItem(const Color(0xFFE91E8C), 'Restroom'),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 11,
+                  height: 11,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                        color: AppColors.crossBuildingOrange, width: 2.5),
+                  ),
+                ),
+                const SizedBox(width: 4),
+                const Text('Cross-building link',
+                    style: TextStyle(fontSize: 9)),
+              ],
+            ),
           ]),
           const SizedBox(height: 3),
           Wrap(spacing: 10, runSpacing: 3, children: [
@@ -2108,6 +2857,9 @@ class _SelectedNodePanel extends StatefulWidget {
   final List<RoomModel> rooms;
   final List<FacilityModel> facilities;
   final bool saving;
+
+  /// "Connected to GET Building Floor 1" — null if not a cross-building node.
+  final String? crossLinkCaption;
   final VoidCallback onDeselect;
   final VoidCallback onEdit;
   final VoidCallback onDelete;
@@ -2124,6 +2876,7 @@ class _SelectedNodePanel extends StatefulWidget {
     required this.rooms,
     required this.facilities,
     required this.saving,
+    this.crossLinkCaption,
     required this.onDeselect,
     required this.onEdit,
     required this.onDelete,
@@ -2206,27 +2959,32 @@ class _SelectedNodePanelState extends State<_SelectedNodePanel> {
             ),
           ),
           const SizedBox(height: 4),
-          if (n.lat != null && n.lng != null)
-            Text(
-              'GPS: ${n.lat!.toStringAsFixed(6)}, ${n.lng!.toStringAsFixed(6)}',
-              style: const TextStyle(
-                  fontSize: 10, color: AppColors.textSecondary),
-            )
-          else ...[
-            Text(
-              'Position: x=${n.x?.toStringAsFixed(1) ?? '—'}, '
-              'y=${n.y?.toStringAsFixed(1) ?? '—'}',
-              style: const TextStyle(
-                  fontSize: 10, color: AppColors.textSecondary),
+          Text(
+            'Pixel position: x=${n.x?.toStringAsFixed(0) ?? '—'}, '
+            'y=${n.y?.toStringAsFixed(0) ?? '—'}',
+            style: const TextStyle(
+                fontSize: 10, color: AppColors.textSecondary),
+          ),
+          if (widget.crossLinkCaption != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Row(
+                children: [
+                  const Icon(Icons.swap_horiz,
+                      size: 14, color: AppColors.crossBuildingOrange),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      widget.crossLinkCaption!,
+                      style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.crossBuildingOrange),
+                    ),
+                  ),
+                ],
+              ),
             ),
-            const Text(
-              '⚠ No GPS — georeference floor plan first',
-              style: TextStyle(
-                  fontSize: 10,
-                  fontWeight: FontWeight.w600,
-                  color: AppColors.warningAmber),
-            ),
-          ],
           Text(
             'Is Navigable: ${n.isNavigable ? 'Yes (navigation node)' : 'No (informational)'}',
             style: TextStyle(
@@ -2237,15 +2995,19 @@ class _SelectedNodePanelState extends State<_SelectedNodePanel> {
           const Divider(height: 16),
 
           if (n.isNavigable) ...[
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              dense: true,
-              title: const Text('Is Room Entrance'),
-              value: _isRoomEntrance,
-              onChanged: (v) => setState(() {
-                _isRoomEntrance = v;
-                if (!v) _link = null;
-              }),
+            // Its own Material: the panel's colour would hide the tile's ink.
+            Material(
+              type: MaterialType.transparency,
+              child: SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                title: const Text('Is Room Entrance'),
+                value: _isRoomEntrance,
+                onChanged: (v) => setState(() {
+                  _isRoomEntrance = v;
+                  if (!v) _link = null;
+                }),
+              ),
             ),
             if (_isRoomEntrance) ...[
               TextField(
@@ -2368,7 +3130,12 @@ class _SelectedNodePanelState extends State<_SelectedNodePanel> {
         onPressed: widget.saving
             ? null
             : () {
-                final parsed = parseLink(_link);
+                // A link to a row that is gone or inactive is dropped on
+                // save; with no lists loaded there is nothing to judge by.
+                final keep =
+                    (widget.rooms.isEmpty && widget.facilities.isEmpty) ||
+                        linkExists(_link, widget.rooms, widget.facilities);
+                final parsed = keep ? parseLink(_link) : null;
                 widget.onSaveEntrance(
                   _n,
                   parsed?.$1,
@@ -2463,6 +3230,10 @@ class _IndoorNodeDialog extends StatefulWidget {
   final List<RoomModel> rooms;
   final List<FacilityModel> facilities;
 
+  /// Every building / floor plan — for the cross-building dropdowns.
+  final List<BuildingModel> buildings;
+  final List<FloorPlanModel> floorPlans;
+
   const _IndoorNodeDialog({
     this.existing,
     this.x,
@@ -2472,6 +3243,8 @@ class _IndoorNodeDialog extends StatefulWidget {
     required this.outdoorEntrances,
     required this.rooms,
     required this.facilities,
+    this.buildings = const [],
+    this.floorPlans = const [],
   });
 
   @override
@@ -2509,6 +3282,21 @@ class _IndoorNodeDialogState extends State<_IndoorNodeDialog> {
   late List<FacilityModel> _facilities;
   bool _loadingLinks = false;
 
+  /// Set when the last [_fetchLinks] failed; the dropdown then shows the
+  /// lists passed in by the editor (possibly stale) under an error + Retry.
+  Object? _linksError;
+
+  // ---- cross-building connection ----
+  final _floorPlanRepo = FloorPlanRepository();
+  late final TextEditingController _crossRef;
+  late bool _crossLink;
+  int? _crossBuildingId;
+  int? _crossFloorPlanId;
+  bool _searchingPartner = false;
+
+  /// Result of "Find Connected Node"; null until searched.
+  List<IndoorNodeModel>? _partners;
+
   bool get _isEdit => widget.existing != null;
 
   @override
@@ -2539,11 +3327,96 @@ class _IndoorNodeDialogState extends State<_IndoorNodeDialog> {
         e?.linkedRoomId != null && e!.linkedRoomId!.isNotEmpty;
     _outdoorEntranceId = e?.outdoorNodeId;
     _linkSelection = linkValue(e?.linkedRoomId, e?.linkedTable ?? 'rooms');
+    _crossRef = TextEditingController(text: e?.crossBuildingRef ?? '');
+    _crossLink = (e?.crossBuildingRef?.trim() ?? '').isNotEmpty;
     if (widget.buildingId != null) _fetchLinks();
+    // Editing a linked node: look up its partner to pre-fill the dropdowns.
+    if (_crossLink) _findPartner();
+  }
+
+  /// Refs are matched exactly, so normalise: trim, upper-case, no spaces.
+  static String _normalizeRef(String s) =>
+      s.trim().toUpperCase().replaceAll(RegExp(r'\s+'), '_');
+
+  BuildingModel? _buildingById(int? id) {
+    for (final b in widget.buildings) {
+      if (b.id == id) return b;
+    }
+    return null;
+  }
+
+  FloorPlanModel? _planById(int? id) {
+    for (final p in widget.floorPlans) {
+      if (p.id == id) return p;
+    }
+    return null;
+  }
+
+  /// "GET Building Floor 1" for a found partner node.
+  String _placeOf(IndoorNodeModel n) {
+    final plan = _planById(n.floorPlanId);
+    final building = _buildingById(n.buildingId ?? plan?.buildingId);
+    return '${building?.name ?? 'Building #${n.buildingId}'} '
+        'Floor ${plan?.floorNumber ?? n.floor}';
+  }
+
+  /// "DPT" from short_name, else the first word of the name.
+  String _buildingCode(BuildingModel? b) {
+    final s = (b?.shortName?.trim().isNotEmpty ?? false)
+        ? b!.shortName!
+        : (b?.name.trim().split(RegExp(r'\s+')).first ?? 'BLDG');
+    return _normalizeRef(s);
+  }
+
+  /// e.g. DPT_GET_LINK_F1, from this floor and the connected building.
+  void _suggestRef() {
+    final here = _planById(widget.floorPlanId);
+    final other = _buildingById(_crossBuildingId);
+    if (other == null) {
+      context.showInfo('Pick the connected building first');
+      return;
+    }
+    final floor = here?.floorNumber ?? int.tryParse(_floor.text.trim()) ?? 1;
+    setState(() {
+      _crossRef.text = '${_buildingCode(_buildingById(widget.buildingId))}_'
+          '${_buildingCode(other)}_LINK_F$floor';
+      _partners = null;
+    });
+  }
+
+  Future<void> _findPartner() async {
+    final ref = _normalizeRef(_crossRef.text);
+    if (ref.isEmpty) {
+      setState(() => _partners = null);
+      return;
+    }
+    setState(() => _searchingPartner = true);
+    try {
+      final found = await _floorPlanRepo.findCrossBuildingPartners(ref,
+          excludeId: widget.existing?.id ?? _id.text.trim());
+      if (!mounted) return;
+      setState(() {
+        _partners = found;
+        _searchingPartner = false;
+        // Fill empty dropdowns from a unique match.
+        if (found.length == 1 && _crossBuildingId == null) {
+          final p = found.first;
+          _crossBuildingId = p.buildingId ?? _planById(p.floorPlanId)?.buildingId;
+          _crossFloorPlanId = p.floorPlanId;
+        }
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _searchingPartner = false);
+      context.showError(e, onRetry: _findPartner);
+    }
   }
 
   Future<void> _fetchLinks() async {
-    setState(() => _loadingLinks = true);
+    setState(() {
+      _loadingLinks = true;
+      _linksError = null;
+    });
     try {
       final rooms = await _roomRepo.getByBuilding(widget.buildingId!);
       final facilities =
@@ -2554,8 +3427,13 @@ class _IndoorNodeDialogState extends State<_IndoorNodeDialog> {
         _facilities = facilities;
         _loadingLinks = false;
       });
-    } catch (_) {
-      if (mounted) setState(() => _loadingLinks = false);
+    } catch (e) {
+      debugPrint('node dialog: rooms/facilities failed to load: $e');
+      if (!mounted) return;
+      setState(() {
+        _linksError = e;
+        _loadingLinks = false;
+      });
     }
   }
 
@@ -2564,7 +3442,7 @@ class _IndoorNodeDialogState extends State<_IndoorNodeDialog> {
     for (final c in [
       _id, _name, _entranceLabel, _outdoorNodeId, _roomName, _roomNumber,
       _description, _floor, _hours, _contact, _stairGroup,
-      _unityX, _unityY, _unityZ,
+      _unityX, _unityY, _unityZ, _crossRef,
     ]) {
       c.dispose();
     }
@@ -2771,6 +3649,7 @@ class _IndoorNodeDialogState extends State<_IndoorNodeDialog> {
                   const SizedBox(height: 10),
                   _linkToRoomDropdown(),
                 ],
+                _crossBuildingSection(),
               ],
 
               // ---- informational fields ----
@@ -2932,7 +3811,13 @@ class _IndoorNodeDialogState extends State<_IndoorNodeDialog> {
         : null;
     // Informational nodes link via the always-visible dropdown; entrance nav
     // nodes link only when the Is Room Entrance toggle is on.
-    final link = (!nav || roomEntrance) ? parseLink(_linkSelection) : null;
+    // A link to a row that is gone or inactive is dropped on save, unless the
+    // lists failed to load and there is nothing to judge by.
+    final linkKnown = _linksError != null ||
+        _loadingLinks ||
+        linkExists(_linkSelection, _rooms, _facilities);
+    final link =
+        (!nav || roomEntrance) && linkKnown ? parseLink(_linkSelection) : null;
     Navigator.pop(
       context,
       IndoorNodeModel(
@@ -2970,9 +3855,182 @@ class _IndoorNodeDialogState extends State<_IndoorNodeDialog> {
                 _stairGroup.text.trim().isNotEmpty
             ? _stairGroup.text.trim()
             : null,
+        crossBuildingRef: nav &&
+                labelIsEntrance &&
+                _crossLink &&
+                _normalizeRef(_crossRef.text).isNotEmpty
+            ? _normalizeRef(_crossRef.text)
+            : null,
         unityX: double.tryParse(_unityX.text.trim()),
         unityY: double.tryParse(_unityY.text.trim()),
         unityZ: double.tryParse(_unityZ.text.trim()),
+      ),
+    );
+  }
+
+  /// "Cross Building Connection" — entrance navigation nodes only.
+  Widget _crossBuildingSection() {
+    final otherBuildings = selectableBuildings(widget.buildings, _crossBuildingId)
+        .where((b) => b.id != null && b.id != widget.buildingId)
+        .toList();
+    final floors = widget.floorPlans
+        .where((p) => p.id != null && p.buildingId == _crossBuildingId)
+        .toList()
+      ..sort((a, b) => (a.floorNumber ?? 0).compareTo(b.floorNumber ?? 0));
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Divider(height: 20),
+        const Row(
+          children: [
+            Icon(Icons.swap_horiz,
+                size: 16, color: AppColors.crossBuildingOrange),
+            SizedBox(width: 6),
+            Text('Cross Building Connection',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+          ],
+        ),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          title: const Text('Links to another building'),
+          value: _crossLink,
+          activeThumbColor: AppColors.crossBuildingOrange,
+          onChanged: (v) => setState(() => _crossLink = v),
+        ),
+        if (_crossLink) ...[
+          DropdownButtonFormField<int>(
+            initialValue: otherBuildings.any((b) => b.id == _crossBuildingId)
+                ? _crossBuildingId
+                : null,
+            isExpanded: true,
+            decoration:
+                const InputDecoration(labelText: 'Connected Building'),
+            items: [
+              for (final b in otherBuildings)
+                DropdownMenuItem(
+                    value: b.id, child: Text(buildingOptionLabel(b))),
+            ],
+            onChanged: (v) => setState(() {
+              _crossBuildingId = v;
+              _crossFloorPlanId = null;
+            }),
+          ),
+          const SizedBox(height: 10),
+          DropdownButtonFormField<int>(
+            // Keyed by building so the selection resets when it changes.
+            key: ValueKey('cross-floor-$_crossBuildingId'),
+            initialValue: floors.any((p) => p.id == _crossFloorPlanId)
+                ? _crossFloorPlanId
+                : null,
+            isExpanded: true,
+            decoration: InputDecoration(
+              labelText: 'Connected Floor',
+              helperText: _crossBuildingId != null && floors.isEmpty
+                  ? 'This building has no floor plans yet'
+                  : null,
+            ),
+            items: [
+              for (final p in floors)
+                DropdownMenuItem(
+                  value: p.id,
+                  child: Text(p.floorName?.isNotEmpty == true
+                      ? '${p.floorName} (Floor ${p.floorNumber ?? '?'})'
+                      : 'Floor ${p.floorNumber ?? '?'}'),
+                ),
+            ],
+            onChanged: (v) => setState(() => _crossFloorPlanId = v),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _crossRef,
+            textCapitalization: TextCapitalization.characters,
+            decoration: InputDecoration(
+              labelText: 'Cross Building Ref ID',
+              hintText: 'e.g. DPT_GET_CORRIDOR_F1',
+              helperText:
+                  'Use same ID on both connected nodes in different buildings',
+              helperMaxLines: 2,
+              suffixIcon: IconButton(
+                tooltip: 'Suggest an ID',
+                icon: const Icon(Icons.auto_fix_high, size: 18),
+                onPressed: _suggestRef,
+              ),
+            ),
+            onChanged: (_) {
+              if (_partners != null) setState(() => _partners = null);
+            },
+          ),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton.icon(
+              onPressed: _searchingPartner ? null : _findPartner,
+              icon: _searchingPartner
+                  ? const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.search, size: 16),
+              label: const Text('Find Connected Node'),
+            ),
+          ),
+          if (_partners != null) ...[
+            const SizedBox(height: 8),
+            _partnerResult(_partners!),
+          ],
+        ],
+      ],
+    );
+  }
+
+  Widget _partnerResult(List<IndoorNodeModel> partners) {
+    final ref = _normalizeRef(_crossRef.text);
+    final (IconData icon, Color color, String text) result;
+    if (partners.isEmpty) {
+      result = (
+        Icons.hourglass_empty,
+        AppColors.warningAmber,
+        'No node with ref $ref yet. Save this node, then give the node in '
+            'the other building the same ref.',
+      );
+    } else if (partners.length > 1) {
+      result = (
+        Icons.error_outline,
+        AppColors.errorRed,
+        'Ref $ref is used by ${partners.length} nodes '
+            '(${partners.map((p) => p.id).join(', ')}). Each connection needs '
+            'its own unique ID.',
+      );
+    } else {
+      final p = partners.first;
+      final pBuilding = p.buildingId ?? _planById(p.floorPlanId)?.buildingId;
+      final mismatch =
+          (_crossBuildingId != null && pBuilding != _crossBuildingId) ||
+              (_crossFloorPlanId != null && p.floorPlanId != _crossFloorPlanId);
+      result = (
+        mismatch ? Icons.warning_amber_rounded : Icons.check_circle,
+        mismatch ? AppColors.warningAmber : AppColors.successGreen,
+        'Found ${p.name?.isNotEmpty == true ? p.name : p.id} in '
+            '${_placeOf(p)}'
+            '${mismatch ? ' — not the building/floor selected above' : ''}',
+      );
+    }
+    return Container(
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: result.$2.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: result.$2),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(result.$1, size: 16, color: result.$2),
+          const SizedBox(width: 6),
+          Expanded(child: Text(result.$3, style: const TextStyle(fontSize: 11))),
+        ],
       ),
     );
   }
@@ -2998,7 +4056,7 @@ class _IndoorNodeDialogState extends State<_IndoorNodeDialog> {
       );
     }
     const noneValue = '__none__';
-    return DropdownButtonFormField<String>(
+    final dropdown = DropdownButtonFormField<String>(
       initialValue: linkExists(_linkSelection, rooms, facilities)
           ? _linkSelection
           : noneValue,
@@ -3042,6 +4100,95 @@ class _IndoorNodeDialogState extends State<_IndoorNodeDialog> {
           }
         });
       },
+    );
+    final error = _linksError;
+    if (error == null) return dropdown;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        ErrorBanner(
+          message: 'Could not load rooms & facilities: $error',
+          onRetry: _fetchLinks,
+        ),
+        dropdown,
+      ],
+    );
+  }
+}
+
+/// Single "Meters per pixel" input. Pops the parsed value, or null on cancel.
+class _ScaleDialog extends StatefulWidget {
+  /// Null when the floor is not calibrated yet.
+  final double? initial;
+
+  const _ScaleDialog({required this.initial});
+
+  @override
+  State<_ScaleDialog> createState() => _ScaleDialogState();
+}
+
+class _ScaleDialogState extends State<_ScaleDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _value =
+      TextEditingController(text: widget.initial?.toString() ?? '');
+
+  @override
+  void dispose() {
+    _value.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    if (!_formKey.currentState!.validate()) return;
+    Navigator.pop(context, double.parse(_value.text.trim()));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Floor Plan Scale'),
+      content: SizedBox(
+        width: 340,
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              TextFormField(
+                controller: _value,
+                autofocus: true,
+                keyboardType:
+                    const TextInputType.numberWithOptions(decimal: true),
+                decoration: InputDecoration(
+                  labelText: 'Meters per pixel',
+                  helperText: widget.initial == null
+                      ? 'Not calibrated yet — distances use a '
+                          '$kDefaultMetersPerPixel estimate'
+                      : widget.initial == kDefaultMetersPerPixel
+                          ? 'Still the default $kDefaultMetersPerPixel — '
+                              'not a measurement'
+                          : null,
+                ),
+                validator: validateMetersPerPixel,
+                onFieldSubmitted: (_) => _save(),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Tip: measure a known distance (e.g. a 10 m hallway) in '
+                'pixels on the image, then enter 10 ÷ pixels.',
+                style: TextStyle(fontSize: 11, color: AppColors.textSecondary),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel')),
+        ElevatedButton(onPressed: _save, child: const Text('Save')),
+      ],
     );
   }
 }

@@ -1,5 +1,9 @@
 import '../../core/utils/parse_utils.dart';
 
+/// Estimated floor plan scale (1 image pixel = 5 cm), used only for
+/// displaying distances while a floor is not calibrated. Never saved.
+const double kDefaultMetersPerPixel = 0.05;
+
 /// Maps to the `building_floors` table.
 class FloorPlanModel {
   final int? id;
@@ -8,8 +12,32 @@ class FloorPlanModel {
   final String? floorName;
   final String? imageUrl;
 
-  // Georeferencing — four corner GPS coordinates + center, set by the
-  // GeoreferencingScreen. Null until the plan has been georeferenced.
+  /// Real-world size of one image pixel. Indoor nodes are stored in pixel
+  /// (x, y), so this converts pixel distances to meters. Null (or a
+  /// non-positive value in the database) means the floor is not calibrated.
+  final double? metersPerPixel;
+
+  /// False while the scale is unset or still the default 0.05, which
+  /// db/floor_plan_pixel_scale.sql wrote to every floor: a measurement of
+  /// exactly 0.05 can't be told apart from the guess, so it stays flagged.
+  bool get isScaleCalibrated =>
+      metersPerPixel != null && metersPerPixel != kDefaultMetersPerPixel;
+
+  /// [metersPerPixel], or the [kDefaultMetersPerPixel] estimate when the
+  /// floor is not calibrated. For display only.
+  double get effectiveMetersPerPixel =>
+      metersPerPixel ?? kDefaultMetersPerPixel;
+
+  /// "0.032 m/px", "0.05 m/px (default)", or "not calibrated".
+  String get scaleLabel {
+    if (metersPerPixel == null) return 'not calibrated';
+    return isScaleCalibrated
+        ? '$metersPerPixel m/px'
+        : '$metersPerPixel m/px (default)';
+  }
+
+  // Optional georeferencing — four corner GPS coordinates + center, set by
+  // the GeoreferencingScreen. Not required for indoor navigation.
   final double? nwLat;
   final double? nwLng;
   final double? neLat;
@@ -33,6 +61,7 @@ class FloorPlanModel {
     this.floorNumber,
     this.floorName,
     this.imageUrl,
+    this.metersPerPixel,
     this.nwLat,
     this.nwLng,
     this.neLat,
@@ -57,6 +86,7 @@ class FloorPlanModel {
       floorNumber: parseInt(json['floor_number']),
       floorName: json['floor_name']?.toString(),
       imageUrl: json['image_url']?.toString(),
+      metersPerPixel: _positiveOrNull(parseDouble(json['meters_per_pixel'])),
       nwLat: parseDouble(json['nw_lat']),
       nwLng: parseDouble(json['nw_lng']),
       neLat: parseDouble(json['ne_lat']),
@@ -75,6 +105,8 @@ class FloorPlanModel {
     );
   }
 
+  /// An uncalibrated scale is left out, so an update never overwrites the
+  /// stored value with a guess.
   Map<String, dynamic> toJson() {
     return {
       if (id != null) 'id': id,
@@ -82,6 +114,7 @@ class FloorPlanModel {
       'floor_number': floorNumber,
       'floor_name': floorName,
       'image_url': imageUrl,
+      'meters_per_pixel': ?metersPerPixel,
       'nw_lat': nwLat,
       'nw_lng': nwLng,
       'ne_lat': neLat,
@@ -105,6 +138,7 @@ class FloorPlanModel {
     int? floorNumber,
     String? floorName,
     String? imageUrl,
+    double? metersPerPixel,
     double? nwLat,
     double? nwLng,
     double? neLat,
@@ -126,6 +160,7 @@ class FloorPlanModel {
       floorNumber: floorNumber ?? this.floorNumber,
       floorName: floorName ?? this.floorName,
       imageUrl: imageUrl ?? this.imageUrl,
+      metersPerPixel: metersPerPixel ?? this.metersPerPixel,
       nwLat: nwLat ?? this.nwLat,
       nwLng: nwLng ?? this.nwLng,
       neLat: neLat ?? this.neLat,
@@ -144,3 +179,22 @@ class FloorPlanModel {
     );
   }
 }
+
+double? _positiveOrNull(double? v) => (v != null && v > 0) ? v : null;
+
+/// Form validator for a meters-per-pixel input.
+String? validateMetersPerPixel(String? v) {
+  final d = double.tryParse((v ?? '').trim());
+  if (d == null || d <= 0) return 'Enter a number greater than 0';
+  if (d > 10) return 'That is over 10 m per pixel — check the value';
+  return null;
+}
+
+/// Like [validateMetersPerPixel], but an empty field is allowed (= not
+/// calibrated yet).
+String? validateOptionalMetersPerPixel(String? v) =>
+    (v ?? '').trim().isEmpty ? null : validateMetersPerPixel(v);
+
+/// The parsed scale from a form field, or null when it is empty.
+double? parseOptionalMetersPerPixel(String text) =>
+    _positiveOrNull(double.tryParse(text.trim()));

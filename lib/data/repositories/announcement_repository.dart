@@ -1,5 +1,6 @@
 import '../../core/config/supabase_config.dart';
 import '../../domain/models/announcement_model.dart';
+import 'paged_query.dart';
 import 'repository_exception.dart';
 
 class AnnouncementRepository {
@@ -8,13 +9,13 @@ class AnnouncementRepository {
 
   Future<List<AnnouncementModel>> getAll() async {
     try {
-      final rows = await _client
+      final rows = await fetchAllPages((a, b) => _client
           .from(_table)
           .select()
-          .order('created_at', ascending: false);
-      return (rows as List)
-          .map((e) => AnnouncementModel.fromJson(e as Map<String, dynamic>))
-          .toList();
+          .order('created_at', ascending: false)
+          .order('id')
+          .range(a, b));
+      return rows.map(AnnouncementModel.fromJson).toList();
     } catch (e) {
       throw RepositoryException('Failed to load announcements', e);
     }
@@ -55,7 +56,11 @@ class AnnouncementRepository {
 
   Future<void> delete(String id) async {
     try {
-      await _client.from(_table).delete().eq('id', id);
+      final rows =
+          await _client.from(_table).delete().eq('id', id).select('id');
+      requireAffected(rows, 'Deleting the announcement');
+    } on RepositoryException {
+      rethrow;
     } catch (e) {
       throw RepositoryException('Failed to delete announcement', e);
     }

@@ -118,7 +118,7 @@ class _AboutUmScreenState extends State<AboutUmScreen> {
       setState(() => _existingId = saved.id);
       if (mounted) context.showSuccess('About UM info saved successfully!');
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _save);
     } finally {
       if (mounted) setState(() => _saving = false);
     }

@@ -14,6 +14,14 @@ class FacilityModel {
   final String? location;
   final String? createdAt;
 
+  /// `facilities.access_level`, see access_level.dart. Null when empty or
+  /// before db/access_level.sql has added the column.
+  final String? accessLevel;
+
+  /// `facilities.is_active`. Missing or null reads as true, matching the
+  /// column default (and rows fetched without that column).
+  final bool isActive;
+
   // From facility_details.
   final int? detailsId;
   final String? officeHours;
@@ -33,6 +41,8 @@ class FacilityModel {
     this.description = const [],
     this.location,
     this.createdAt,
+    this.accessLevel,
+    this.isActive = true,
     this.detailsId,
     this.officeHours,
     this.contactNumber,
@@ -65,6 +75,8 @@ class FacilityModel {
       description: parseStringList(json['description']),
       location: json['location']?.toString(),
       createdAt: json['created_at']?.toString(),
+      accessLevel: json['access_level']?.toString(),
+      isActive: parseBool(json['is_active'], fallback: true),
       detailsId: parseInt(details?['id']),
       officeHours: details?['office_hours']?.toString(),
       contactNumber: details?['contact_number']?.toString(),
@@ -74,7 +86,8 @@ class FacilityModel {
     );
   }
 
-  /// Columns written to the `facilities` table.
+  /// Columns written to the `facilities` table. A null [accessLevel] is left
+  /// out, so saves work before db/access_level.sql has been run.
   Map<String, dynamic> facilityJson() => {
         'roomname': roomname,
         'room_number': roomNumber,
@@ -83,6 +96,8 @@ class FacilityModel {
         'location': location,
         'facility_categories': facilityCategories,
         'description': description,
+        'access_level': ?accessLevel,
+        'is_active': isActive,
       };
 
   /// Columns written to the `facility_details` table (excludes `facility_id`,

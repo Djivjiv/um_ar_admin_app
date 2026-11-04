@@ -66,7 +66,8 @@ class RoomModel {
       'floor': floor,
       'short_name': shortName,
       'type': type,
-      'access_level': accessLevel,
+      // Left out when null, so a form that didn't touch it can't blank it.
+      'access_level': ?accessLevel,
       'opening_hours': openingHours,
       'contact': contact,
       'services': services,

@@ -89,13 +89,13 @@ BEGIN
     BEGIN
         BLOCK "040904e4"
         BEGIN
-            VALUE "CompanyName", "com.example" "\0"
-            VALUE "FileDescription", "um_ar_admin" "\0"
+            VALUE "CompanyName", "UM-AR Nav Admin" "\0"
+            VALUE "FileDescription", "UM-AR Nav Admin" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "um_ar_admin" "\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 com.example. All rights reserved." "\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 UM-AR Nav Admin. All rights reserved." "\0"
             VALUE "OriginalFilename", "um_ar_admin.exe" "\0"
-            VALUE "ProductName", "um_ar_admin" "\0"
+            VALUE "ProductName", "UM-AR Nav Admin" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

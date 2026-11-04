@@ -18,15 +18,20 @@ const kNavDestinations = <NavDestination>[
   NavDestination('Rooms', Icons.meeting_room_outlined, '/rooms'),
   NavDestination('Facilities', Icons.room_preferences_outlined, '/facilities'),
   NavDestination('Campus Map', Icons.map_outlined, '/campus-map'),
+  NavDestination('Outdoor AR', Icons.view_in_ar, '/outdoor-ar'),
   NavDestination('Floor Plans', Icons.layers_outlined, '/floor-plans'),
   NavDestination('Context Content', Icons.article_outlined, '/context-content'),
+  NavDestination('Announcements', Icons.campaign_outlined, '/announcements'),
   NavDestination('About UM', Icons.info_outline, '/about-um'),
   NavDestination('Users', Icons.people_outline, '/users'),
   NavDestination(
       'Visitor Sessions', Icons.travel_explore_outlined, '/visitor-sessions'),
+  NavDestination('Kiosk Management', Icons.tablet_mac, '/kiosk'),
   NavDestination('Analytics', Icons.bar_chart_outlined, '/analytics'),
   NavDestination('SUS Responses', Icons.assignment_turned_in_outlined,
       '/sus-responses'),
+  NavDestination(
+      'Suggestions & Comments', Icons.forum_outlined, '/feedback-comments'),
 ];
 
 class AdminSidebar extends StatelessWidget {

@@ -18,7 +18,9 @@ class _LoginScreenState extends State<LoginScreen> {
 
   bool _obscure = true;
   bool _loading = false;
-  String? _error;
+
+  /// Starts with the reason, if the app just signed this admin out.
+  String? _error = AuthRepository.instance.takeSignOutReason();
 
   @override
   void dispose() {
@@ -33,20 +35,12 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => _loading = true);
     try {
       final auth = AuthRepository.instance;
+      // Sets isAdmin and notifies the router, whose redirect moves to
+      // /dashboard. The go() below is only a fallback, so no waiting needed.
       await auth.signInAsAdmin(
         email: _email.text,
         password: _password.text,
       );
-
-      // Wait for the session to be fully settled before navigating so the
-      // router redirect guard sees an authenticated admin.
-      var waitedMs = 0;
-      while (!auth.canAccessAdmin && waitedMs < 3000) {
-        await Future.delayed(const Duration(milliseconds: 100));
-        waitedMs += 100;
-      }
-      await Future.delayed(const Duration(milliseconds: 500));
-
       if (!mounted) return;
       if (!auth.canAccessAdmin) {
         setState(() =>

@@ -4,8 +4,8 @@ import 'package:intl/intl.dart';
 
 import '../../../core/constants/app_colors.dart';
 import '../../../core/utils/excel_export.dart';
+import '../../../core/utils/sus_dedupe.dart';
 import '../../../core/utils/ui_helpers.dart';
-import '../../../data/repositories/analytics_repository.dart' show ChartPoint;
 import '../../../data/repositories/survey_question_repository.dart';
 import '../../../data/repositories/sus_repository.dart';
 import '../../../domain/models/survey_question_model.dart';
@@ -24,19 +24,12 @@ class SusResponsesScreen extends StatefulWidget {
 }
 
 class _SusData {
-  final List<SusResponseModel> responses;
-  final double average;
-  final List<ChartPoint> distribution;
-  final List<ChartPoint> byUserType;
+  final SusStats stats;
   final List<SurveyQuestionModel> questions;
 
-  _SusData({
-    required this.responses,
-    required this.average,
-    required this.distribution,
-    required this.byUserType,
-    required this.questions,
-  });
+  _SusData({required this.stats, required this.questions});
+
+  List<SusResponseModel> get responses => stats.responses;
 }
 
 class _SusResponsesScreenState extends State<SusResponsesScreen> {
@@ -53,22 +46,20 @@ class _SusResponsesScreenState extends State<SusResponsesScreen> {
 
   Future<_SusData> _load() async {
     final results = await Future.wait([
-      _repo.getAll(),
-      _repo.getAverageScore(),
-      _repo.getScoreDistribution(),
-      _repo.getScoreByUserType(),
+      _repo.getStats(),
       _questionRepo.getAll(),
     ]);
     return _SusData(
-      responses: results[0] as List<SusResponseModel>,
-      average: results[1] as double,
-      distribution: results[2] as List<ChartPoint>,
-      byUserType: results[3] as List<ChartPoint>,
-      questions: results[4] as List<SurveyQuestionModel>,
+      stats: results[0] as SusStats,
+      questions: results[1] as List<SurveyQuestionModel>,
     );
   }
 
-  void _reload() => setState(() => _future = _load());
+  void _reload() {
+    setState(() {
+      _future = _load();
+    });
+  }
 
   Future<void> _export() async {
     setState(() => _exporting = true);
@@ -80,7 +71,7 @@ class _SusResponsesScreenState extends State<SusResponsesScreen> {
             path == null ? 'Export cancelled' : 'Saved to $path');
       }
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _export);
     } finally {
       if (mounted) setState(() => _exporting = false);
     }
@@ -97,7 +88,7 @@ class _SusResponsesScreenState extends State<SusResponsesScreen> {
       if (mounted) context.showSuccess('Question ${q.questionNumber} updated');
       _reload();
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: () => _editQuestion(q));
     }
   }
 
@@ -167,7 +158,8 @@ class _SusResponsesScreenState extends State<SusResponsesScreen> {
         final count = d.responses.length;
         final passing =
             d.responses.where((r) => (r.susScore ?? 0) >= 68).length;
-        final grade = _grade(d.average);
+        final grade = _grade(d.stats.average);
+        final note = susDedupeNote(d.stats.dedupe);
 
         return SingleChildScrollView(
           child: Column(
@@ -204,14 +196,14 @@ class _SusResponsesScreenState extends State<SusResponsesScreen> {
                   final cards = [
                     StatCard(
                       icon: Icons.assignment_turned_in,
-                      title: 'Total Responses',
+                      title: 'Responses (one per person)',
                       value: '$count',
                       iconColor: AppColors.primaryMaroon,
                     ),
                     StatCard(
                       icon: Icons.analytics,
                       title: 'Average Score',
-                      value: d.average.toStringAsFixed(1),
+                      value: d.stats.average.toStringAsFixed(1),
                       iconColor: AppColors.infoBlue,
                     ),
                     StatCard(
@@ -239,18 +231,25 @@ class _SusResponsesScreenState extends State<SusResponsesScreen> {
                   );
                 },
               ),
+              if (note != null) ...[
+                const SizedBox(height: 8),
+                Text(note,
+                    style: const TextStyle(
+                        fontSize: 12, color: AppColors.textSecondary)),
+              ],
               const SizedBox(height: 16),
               LayoutBuilder(
                 builder: (context, constraints) {
                   final two = constraints.maxWidth > 900;
                   final a = ChartCard(
                     title: 'Score Distribution',
-                    child: BarChartView(points: d.distribution),
+                    child: BarChartView(points: d.stats.distribution),
                   );
                   final b = ChartCard(
                     title: 'Average Score by User Type',
                     child: BarChartView(
-                        points: d.byUserType, color: AppColors.infoBlue),
+                        points: d.stats.byUserType,
+                        color: AppColors.infoBlue),
                   );
                   if (!two) {
                     return Column(

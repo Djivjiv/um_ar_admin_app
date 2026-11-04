@@ -3,7 +3,10 @@ import 'package:flutter/material.dart';
 import '../../../core/utils/ui_helpers.dart';
 import '../../../data/repositories/room_repository.dart';
 import '../../../domain/models/building_model.dart';
+import '../../../domain/models/access_level.dart';
 import '../../../domain/models/room_model.dart';
+import '../../widgets/access_level_fields.dart';
+import '../../widgets/confirm_dialog.dart';
 import '../../widgets/form_input.dart';
 import '../../widgets/tag_input.dart';
 
@@ -33,7 +36,6 @@ class _RoomFormState extends State<RoomForm> {
   late final TextEditingController _shortName;
   late final TextEditingController _floor;
   late final TextEditingController _type;
-  late final TextEditingController _accessLevel;
   late final TextEditingController _openingHours;
   late final TextEditingController _contact;
   late final TextEditingController _description;
@@ -41,6 +43,7 @@ class _RoomFormState extends State<RoomForm> {
   int? _buildingId;
   late List<String> _services;
   late Set<String> _paymentMethods;
+  late String _accessLevel;
   late bool _isActive;
   bool _saving = false;
 
@@ -54,7 +57,7 @@ class _RoomFormState extends State<RoomForm> {
     _shortName = TextEditingController(text: r?.shortName ?? '');
     _floor = TextEditingController(text: r?.floor ?? '');
     _type = TextEditingController(text: r?.type ?? '');
-    _accessLevel = TextEditingController(text: r?.accessLevel ?? '');
+    _accessLevel = selectedAccessLevel(r?.accessLevel);
     _openingHours = TextEditingController(text: r?.openingHours ?? '');
     _contact = TextEditingController(text: r?.contact ?? '');
     _description = TextEditingController(text: r?.description ?? '');
@@ -71,7 +74,6 @@ class _RoomFormState extends State<RoomForm> {
       _shortName,
       _floor,
       _type,
-      _accessLevel,
       _openingHours,
       _contact,
       _description,
@@ -85,6 +87,17 @@ class _RoomFormState extends State<RoomForm> {
     if (!_formKey.currentState!.validate()) return;
     setState(() => _saving = true);
     try {
+      final existing = widget.room;
+      if (existing != null && existing.isActive && !_isActive) {
+        final linked = await _repo.linkedNodeCount(existing.id!);
+        if (!mounted) return;
+        final ok = await ConfirmDialog.showDeactivate(
+          context,
+          itemName: _roomname.text.trim(),
+          linkedNodes: linked,
+        );
+        if (!ok) return;
+      }
       final model = RoomModel(
         id: widget.room?.id,
         buildingId: _buildingId,
@@ -92,8 +105,7 @@ class _RoomFormState extends State<RoomForm> {
         shortName: _shortName.text.trim().isEmpty ? null : _shortName.text.trim(),
         floor: _floor.text.trim().isEmpty ? null : _floor.text.trim(),
         type: _type.text.trim().isEmpty ? null : _type.text.trim(),
-        accessLevel:
-            _accessLevel.text.trim().isEmpty ? null : _accessLevel.text.trim(),
+        accessLevel: accessLevelToSave(_accessLevel, widget.room?.accessLevel),
         openingHours:
             _openingHours.text.trim().isEmpty ? null : _openingHours.text.trim(),
         contact: _contact.text.trim().isEmpty ? null : _contact.text.trim(),
@@ -113,7 +125,7 @@ class _RoomFormState extends State<RoomForm> {
       context.showSuccess(_isEdit ? 'Room updated' : 'Room created');
       Navigator.of(context).pop(true);
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _save);
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -135,7 +147,8 @@ class _RoomFormState extends State<RoomForm> {
                 : null,
             items: [
               for (final b in widget.buildings)
-                DropdownMenuItem(value: b.id, child: Text(b.name)),
+                DropdownMenuItem(
+                    value: b.id, child: Text(buildingOptionLabel(b))),
             ],
             onChanged: (v) => setState(() => _buildingId = v),
             validator: (v) => v == null ? 'Select a building' : null,
@@ -152,14 +165,12 @@ class _RoomFormState extends State<RoomForm> {
             ],
           ),
           const SizedBox(height: 14),
-          Row(
-            children: [
-              Expanded(child: FormInput(label: 'Type', controller: _type)),
-              const SizedBox(width: 12),
-              Expanded(
-                  child: FormInput(
-                      label: 'Access Level', controller: _accessLevel)),
-            ],
+          FormInput(label: 'Type', controller: _type),
+          const SizedBox(height: 14),
+          AccessLevelField(
+            value: _accessLevel,
+            stored: widget.room?.accessLevel,
+            onChanged: (v) => setState(() => _accessLevel = v),
           ),
           const SizedBox(height: 14),
           FormInput(label: 'Opening Hours', controller: _openingHours),

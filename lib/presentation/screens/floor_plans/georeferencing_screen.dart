@@ -1,4 +1,3 @@
-import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
@@ -7,17 +6,19 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:go_router/go_router.dart';
 import 'package:latlong2/latlong.dart';
 
+import '../../../core/config/maptiler_config.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../core/utils/ui_helpers.dart';
 import '../../../data/repositories/floor_plan_repository.dart';
 import '../../../domain/models/building_model.dart';
 import '../../../domain/models/floor_plan_model.dart';
+import '../../widgets/maptiler_key_notice.dart';
 
 const _cMaroon = Color(0xFF7B1C1C);
 const _cGold = Color(0xFFC9972C);
 const _cCharcoal = Color(0xFF1A1A1A);
 
-const _mtKey = '7IdsZLpK0EDETzZ6ITe6';
+const _mtKey = MapTilerConfig.apiKey;
 const _streetsUrl =
     'https://api.maptiler.com/maps/streets-v2/{z}/{x}/{y}.png?key=$_mtKey';
 const _umOverlayUrl =
@@ -35,12 +36,8 @@ class GeoreferencingScreen extends StatefulWidget {
   final int floorNumber;
   final String floorLabel;
 
-  /// A freshly-picked local file — set when georeferencing a brand new
-  /// upload that hasn't been sent to Supabase Storage yet.
-  final File? imageFile;
-
-  /// The existing `building_floors` row — set when re-georeferencing (or
-  /// adjusting) a floor plan that's already been uploaded.
+  /// The existing `building_floors` row being georeferenced. Its image is
+  /// already in Supabase Storage (uploaded from the Floor Plans screen).
   final FloorPlanModel? existingFloorPlan;
 
   const GeoreferencingScreen({
@@ -48,7 +45,6 @@ class GeoreferencingScreen extends StatefulWidget {
     required this.building,
     required this.floorNumber,
     required this.floorLabel,
-    this.imageFile,
     this.existingFloorPlan,
   });
 
@@ -71,8 +67,7 @@ class _GeoreferencingScreenState extends State<GeoreferencingScreen> {
   bool _saving = false;
 
   bool get _hasImage =>
-      widget.imageFile != null ||
-      ((widget.existingFloorPlan?.imageUrl ?? '').isNotEmpty);
+      (widget.existingFloorPlan?.imageUrl ?? '').isNotEmpty;
 
   @override
   void initState() {
@@ -145,11 +140,8 @@ class _GeoreferencingScreenState extends State<GeoreferencingScreen> {
     stream.addListener(listener);
   }
 
-  ImageProvider get _imageProvider {
-    final file = widget.imageFile;
-    if (file != null) return FileImage(file);
-    return CachedNetworkImageProvider(widget.existingFloorPlan!.imageUrl!);
-  }
+  ImageProvider get _imageProvider =>
+      CachedNetworkImageProvider(widget.existingFloorPlan!.imageUrl!);
 
   // --- overlay geometry ----------------------------------------------
 
@@ -184,6 +176,7 @@ class _GeoreferencingScreenState extends State<GeoreferencingScreen> {
 
   // Fixed UM Campus Map tiles — no layer switching.
   List<Widget> _tileLayers() {
+    if (!MapTilerConfig.isConfigured) return const [];
     return [
       TileLayer(
         urlTemplate: _streetsUrl,
@@ -207,18 +200,7 @@ class _GeoreferencingScreenState extends State<GeoreferencingScreen> {
     }
     setState(() => _saving = true);
     try {
-      var imageUrl = widget.existingFloorPlan?.imageUrl;
-      final file = widget.imageFile;
-      if (file != null) {
-        final bytes = await file.readAsBytes();
-        final srcPath = file.path;
-        final dot = srcPath.lastIndexOf('.');
-        final ext = dot == -1 ? '.png' : srcPath.substring(dot);
-        final storagePath = '${widget.building.id}/floor_${widget.floorNumber}_'
-            '${DateTime.now().millisecondsSinceEpoch}$ext';
-        imageUrl = await _repo.uploadImageAtPath(storagePath, bytes);
-      }
-
+      final imageUrl = widget.existingFloorPlan?.imageUrl;
       final bounds = _overlayBounds;
       final model = FloorPlanModel(
         id: widget.existingFloorPlan?.id,
@@ -226,6 +208,8 @@ class _GeoreferencingScreenState extends State<GeoreferencingScreen> {
         floorNumber: widget.floorNumber,
         floorName: widget.floorLabel,
         imageUrl: imageUrl,
+        // Null (not calibrated) is left out of the save, never guessed.
+        metersPerPixel: widget.existingFloorPlan?.metersPerPixel,
         nwLat: bounds.north,
         nwLng: bounds.west,
         neLat: bounds.north,
@@ -252,7 +236,7 @@ class _GeoreferencingScreenState extends State<GeoreferencingScreen> {
       context.showSuccess('Floor plan saved and georeferenced successfully!');
       context.go('/floor-plans');
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _save);
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -299,6 +283,12 @@ class _GeoreferencingScreenState extends State<GeoreferencingScreen> {
             child: Stack(
               children: [
                 Positioned.fill(child: _map()),
+                const Positioned(
+                  top: 12,
+                  left: 12,
+                  right: 12,
+                  child: MapTilerKeyNotice(),
+                ),
                 if (!_hasImage)
                   Positioned.fill(
                     child: ColoredBox(

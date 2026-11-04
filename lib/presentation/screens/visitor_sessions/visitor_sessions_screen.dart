@@ -3,12 +3,21 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../../../core/constants/app_colors.dart';
+import '../../../core/utils/navigation_metrics.dart';
+import '../../../core/utils/short_code.dart';
 import '../../../data/repositories/visitor_session_repository.dart';
-import '../../../domain/models/navigation_session_model.dart';
-import '../../../domain/models/visitor_session_model.dart';
 import '../../widgets/data_table_card.dart';
+import '../../widgets/error_banner.dart';
 import '../../widgets/slide_panel.dart';
 import '../../widgets/status_badge.dart';
+
+String _fmt(DateTime? d) =>
+    d == null ? '—' : DateFormat('MMM d, y h:mm a').format(d);
+
+/// How the trip was logged, from `is_visitor` (`user_id` on older rows). A
+/// visitor who later signs in on the same phone can have both in one history.
+String tripAccountLabel(NavigationTrip trip) =>
+    trip.isVisitor ? 'Visitor' : 'Signed in';
 
 class VisitorSessionsScreen extends StatefulWidget {
   const VisitorSessionsScreen({super.key});
@@ -19,31 +28,41 @@ class VisitorSessionsScreen extends StatefulWidget {
 
 class _VisitorSessionsScreenState extends State<VisitorSessionsScreen> {
   final _repo = VisitorSessionRepository();
-  late Future<List<VisitorSessionModel>> _future;
+  late Future<List<VisitorEntry>> _future;
 
   @override
   void initState() {
     super.initState();
-    _future = _repo.getAll();
+    _future = _repo.getEntries();
   }
 
-  void _reload() => setState(() => _future = _repo.getAll());
+  void _reload() {
+    setState(() {
+      _future = _repo.getEntries();
+    });
+  }
 
-  void _openDetail(VisitorSessionModel session) {
+  void _openDetail(VisitorEntry entry) {
     SlidePanel.show(
       context,
-      title: 'Visitor Session',
-      subtitle: session.deviceId,
-      body: _SessionDetail(session: session, repo: _repo),
+      title: entry.isOffline ? 'Offline Visitor' : 'Visitor Session',
+      subtitle: shortDeviceCode(entry.deviceCode),
+      body: _VisitorDetail(entry: entry, repo: _repo),
     );
   }
 
-  String _fmt(DateTime? d) =>
-      d == null ? '—' : DateFormat('MMM d, y h:mm a').format(d);
+  StatusBadge _badge(VisitorEntry v) => StatusBadge(
+        status: v.isOffline
+            ? BadgeStatus.pending
+            : v.isActive
+                ? BadgeStatus.active
+                : BadgeStatus.inactive,
+        label: v.statusLabel,
+      );
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<List<VisitorSessionModel>>(
+    return FutureBuilder<List<VisitorEntry>>(
       future: _future,
       builder: (context, snapshot) {
         final loading =
@@ -60,9 +79,11 @@ class _VisitorSessionsScreenState extends State<VisitorSessionsScreen> {
             ),
           );
         }
-        final sessions = snapshot.data ?? [];
+        final entries = snapshot.data ?? [];
+        final offline = entries.where((e) => e.isOffline).length;
         return DataTableCard(
-          title: '${sessions.length} Visitor Sessions',
+          title: '${entries.length - offline} Visitor Sessions'
+              '${offline == 0 ? '' : ', $offline offline'}',
           isLoading: loading,
           columns: const [
             DataColumn2(label: Text('Device'), size: ColumnSize.L),
@@ -71,23 +92,20 @@ class _VisitorSessionsScreenState extends State<VisitorSessionsScreen> {
             DataColumn2(label: Text('Status'), size: ColumnSize.S),
           ],
           rows: [
-            for (final s in sessions)
+            for (final v in entries)
               DataRow2(
-                onTap: () => _openDetail(s),
-                color: s.isActive
+                onTap: () => _openDetail(v),
+                color: v.isActive
                     ? WidgetStatePropertyAll(
                         AppColors.successGreen.withValues(alpha: 0.08))
                     : null,
                 cells: [
-                  DataCell(Text(s.deviceId ?? s.id)),
-                  DataCell(Text(_fmt(s.startedAt))),
-                  DataCell(Text(_fmt(s.expiresAt))),
-                  DataCell(StatusBadge(
-                    status: s.isActive
-                        ? BadgeStatus.active
-                        : BadgeStatus.inactive,
-                    label: s.isActive ? 'Active' : 'Expired',
-                  )),
+                  DataCell(Text(v.deviceCode != null
+                      ? shortDeviceCode(v.deviceCode)
+                      : shortId(v.session?.id ?? '—'))),
+                  DataCell(Text(_fmt(v.startedAt))),
+                  DataCell(Text(_fmt(v.session?.expiresAt))),
+                  DataCell(_badge(v)),
                 ],
               ),
           ],
@@ -97,69 +115,102 @@ class _VisitorSessionsScreenState extends State<VisitorSessionsScreen> {
   }
 }
 
-class _SessionDetail extends StatefulWidget {
-  final VisitorSessionModel session;
+class _VisitorDetail extends StatefulWidget {
+  final VisitorEntry entry;
   final VisitorSessionRepository repo;
 
-  const _SessionDetail({required this.session, required this.repo});
+  const _VisitorDetail({required this.entry, required this.repo});
 
   @override
-  State<_SessionDetail> createState() => _SessionDetailState();
+  State<_VisitorDetail> createState() => _VisitorDetailState();
 }
 
-class _SessionDetailState extends State<_SessionDetail> {
-  late Future<List<NavigationSessionModel>> _future;
+class _VisitorDetailState extends State<_VisitorDetail> {
+  late Future<VisitorHistory> _future;
 
   @override
   void initState() {
     super.initState();
-    _future = widget.repo.getNavigationHistory(widget.session.id);
+    _future = widget.repo.getTripHistory(widget.entry);
+  }
+
+  void _reload() {
+    setState(() {
+      _future = widget.repo.getTripHistory(widget.entry);
+    });
+  }
+
+  Widget _tripTile(NavigationTrip t) {
+    final from = t.fromName.isEmpty ? '?' : t.fromName;
+    final to = t.toName.isEmpty ? '?' : t.toName;
+    return ListTile(
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      leading: const Icon(Icons.near_me, size: 16),
+      title: Text('$from → $to', style: const TextStyle(fontSize: 12)),
+      subtitle: Text(
+        '${t.distanceMeters?.toStringAsFixed(0) ?? '?'} m · '
+        '${modeLabel(t.mode)} · ${t.outcome} · ${tripAccountLabel(t)}',
+        style: const TextStyle(fontSize: 11),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final s = widget.session;
+    final v = widget.entry;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _row('Session ID', s.id),
-        _row('Device ID', s.deviceId ?? '—'),
-        _row('Started', s.startedAt?.toString() ?? '—'),
-        _row('Expires', s.expiresAt?.toString() ?? '—'),
-        _row('Status', s.isActive ? 'Active' : 'Expired'),
+        if (v.isOffline) ...[
+          const Text(
+            'No session row: the app had no connection when this visitor '
+            'started. Found by device code in their trips and SUS answers.',
+            style: TextStyle(fontSize: 12, color: AppColors.textSecondary),
+          ),
+          const SizedBox(height: 8),
+          _row('Device code', shortDeviceCode(v.deviceCode)),
+          _row('First seen', _fmt(v.startedAt)),
+          _row('Last seen', _fmt(v.lastSeenAt)),
+        ] else ...[
+          _row('Session ID', v.session!.id),
+          _row('Device code', shortDeviceCode(v.deviceCode)),
+          _row('Started', _fmt(v.startedAt)),
+          _row('Expires', _fmt(v.session!.expiresAt)),
+        ],
+        _row('Status', v.statusLabel),
         const Divider(height: 24),
         const Text('Navigation History',
             style: TextStyle(fontWeight: FontWeight.bold)),
         const SizedBox(height: 8),
-        FutureBuilder<List<NavigationSessionModel>>(
+        FutureBuilder<VisitorHistory>(
           future: _future,
           builder: (context, snapshot) {
             if (snapshot.connectionState == ConnectionState.waiting) {
               return const Center(child: CircularProgressIndicator());
             }
             if (snapshot.hasError) {
-              return Text(snapshot.error.toString());
+              return ErrorBanner(
+                  message: snapshot.error.toString(), onRetry: _reload);
             }
-            final items = snapshot.data ?? [];
-            if (items.isEmpty) {
-              return const Text('No navigation sessions',
-                  style: TextStyle(color: AppColors.textSecondary));
-            }
+            final history = snapshot.data ?? const VisitorHistory();
+            final older = history.rowsWithoutTrip;
             return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                for (final n in items)
-                  ListTile(
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    leading: const Icon(Icons.near_me, size: 16),
-                    title: Text('${n.fromName ?? '?'} → ${n.toName ?? '?'}',
-                        style: const TextStyle(fontSize: 12)),
-                    subtitle: Text(
-                      '${n.distanceMeters?.toStringAsFixed(0) ?? '?'} m · '
-                      '${n.completed ? 'completed' : 'incomplete'}',
-                      style: const TextStyle(fontSize: 11),
-                    ),
+                if (history.trips.isEmpty)
+                  const Text('No navigation trips',
+                      style: TextStyle(color: AppColors.textSecondary)),
+                for (final t in history.trips) _tripTile(t),
+                if (older > 0) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    '$older older ${older == 1 ? 'row' : 'rows'} with no '
+                    'trip_id left out.',
+                    style: const TextStyle(
+                        fontSize: 11, color: AppColors.textSecondary),
                   ),
+                ],
               ],
             );
           },

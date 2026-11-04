@@ -9,9 +9,8 @@ class IndoorNodeModel {
   final double? x;
   final double? y;
 
-  /// Real-world GPS coordinates, derived from the floor plan's georeferencing
-  /// (bilinear-interpolated from the four corner points). Null until the
-  /// floor plan has been georeferenced.
+  /// Legacy GPS coordinates from the old georeferencing workflow. No longer
+  /// written by the editor — [x]/[y] image pixels are the source of truth.
   final double? lat;
   final double? lng;
 
@@ -41,6 +40,11 @@ class IndoorNodeModel {
   /// Shared id for the same staircase/elevator across every floor
   /// (e.g. `BE_STAIRS_A`). Only meaningful for `stairs`/`elevator` labels.
   final String? stairGroup;
+
+  /// Shared id linking this node to a node in another building
+  /// (e.g. `DPT_GET_CORRIDOR_F1`). The two nodes with the same ref are joined
+  /// by an edge. Only meaningful for `entrance` labels.
+  final String? crossBuildingRef;
 
   /// AR-space coordinates for this node, calibrated per floor in Unity.
   final double? unityX;
@@ -74,6 +78,7 @@ class IndoorNodeModel {
     this.operatingHours,
     this.contact,
     this.stairGroup,
+    this.crossBuildingRef,
     this.unityX,
     this.unityY,
     this.unityZ,
@@ -106,6 +111,7 @@ class IndoorNodeModel {
       operatingHours: json['operating_hours']?.toString(),
       contact: json['contact']?.toString(),
       stairGroup: json['stair_group']?.toString(),
+      crossBuildingRef: json['cross_building_ref']?.toString(),
       unityX: parseDouble(json['unity_x']),
       unityY: parseDouble(json['unity_y']),
       unityZ: parseDouble(json['unity_z']),
@@ -140,6 +146,7 @@ class IndoorNodeModel {
       'operating_hours': nn(operatingHours),
       'contact': nn(contact),
       'stair_group': nn(stairGroup),
+      'cross_building_ref': nn(crossBuildingRef),
       'unity_x': unityX,
       'unity_y': unityY,
       'unity_z': unityZ,
@@ -168,6 +175,7 @@ class IndoorNodeModel {
     String? operatingHours,
     String? contact,
     String? stairGroup,
+    String? crossBuildingRef,
     double? unityX,
     double? unityY,
     double? unityZ,
@@ -197,6 +205,7 @@ class IndoorNodeModel {
       operatingHours: operatingHours ?? this.operatingHours,
       contact: contact ?? this.contact,
       stairGroup: stairGroup ?? this.stairGroup,
+      crossBuildingRef: crossBuildingRef ?? this.crossBuildingRef,
       unityX: unityX ?? this.unityX,
       unityY: unityY ?? this.unityY,
       unityZ: unityZ ?? this.unityZ,

@@ -1,3 +1,4 @@
+import '../../core/utils/navigation_metrics.dart' show isVisitorRow;
 import '../../core/utils/parse_utils.dart';
 
 class SusResponseModel {
@@ -6,8 +7,17 @@ class SusResponseModel {
   final String? visitorSessionId;
   final List<int?> answers; // q1..q10, index 0 = q1
   final double? susScore;
+
+  /// The role the user app recorded, e.g. student or visitor.
   final String? userType;
   final DateTime? submittedAt;
+
+  /// The raw install code. Only ever exported as `anonymousDeviceId`.
+  final String? deviceCode;
+
+  /// The trip this answer followed: `navigation_sessions.trip_id`.
+  final String? navigationSessionId;
+  final bool isVisitor;
 
   const SusResponseModel({
     required this.id,
@@ -17,6 +27,9 @@ class SusResponseModel {
     this.susScore,
     this.userType,
     this.submittedAt,
+    this.deviceCode,
+    this.navigationSessionId,
+    this.isVisitor = false,
   });
 
   int? answerFor(int question) {
@@ -34,6 +47,9 @@ class SusResponseModel {
       susScore: parseDouble(json['sus_score']),
       userType: json['user_type']?.toString(),
       submittedAt: parseDate(json['submitted_at']),
+      deviceCode: json['device_code']?.toString(),
+      navigationSessionId: json['navigation_session_id']?.toString(),
+      isVisitor: isVisitorRow(json),
     );
   }
 
@@ -44,6 +60,8 @@ class SusResponseModel {
       'visitor_session_id': visitorSessionId,
       'sus_score': susScore,
       'user_type': userType,
+      'device_code': deviceCode,
+      'navigation_session_id': navigationSessionId,
     };
     for (var i = 0; i < answers.length && i < 10; i++) {
       map['q${i + 1}'] = answers[i];

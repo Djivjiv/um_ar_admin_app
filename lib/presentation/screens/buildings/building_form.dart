@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../../core/utils/ui_helpers.dart';
 import '../../../data/repositories/building_repository.dart';
 import '../../../domain/models/building_model.dart';
+import '../../widgets/confirm_dialog.dart';
 import '../../widgets/form_input.dart';
 import '../../widgets/image_upload.dart';
 import '../../widgets/tag_input.dart';
@@ -79,6 +80,17 @@ class _BuildingFormState extends State<BuildingForm> {
     if (!_formKey.currentState!.validate()) return;
     setState(() => _saving = true);
     try {
+      final existing = widget.building;
+      if (existing != null && existing.isActive && !_isActive) {
+        final linked = await _repo.linkedNodeCount(existing.id!);
+        if (!mounted) return;
+        final ok = await ConfirmDialog.showDeactivate(
+          context,
+          itemName: _name.text.trim(),
+          linkedNodes: linked,
+        );
+        if (!ok) return;
+      }
       var imageUrl = _imageUrl;
       if (_pickedImage != null) {
         imageUrl =
@@ -100,6 +112,11 @@ class _BuildingFormState extends State<BuildingForm> {
         isAccessible: _isAccessible,
         isActive: _isActive,
         imageUrl: imageUrl,
+        // Edited on the Campus Map, not here. toJson writes them, so leaving
+        // them out would clear them on every save.
+        labelLat: existing?.labelLat,
+        labelLng: existing?.labelLng,
+        displayName: existing?.displayName,
       );
       if (_isEdit) {
         await _repo.update(model);
@@ -110,7 +127,7 @@ class _BuildingFormState extends State<BuildingForm> {
       context.showSuccess(_isEdit ? 'Building updated' : 'Building created');
       Navigator.of(context).pop(true);
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _save);
     } finally {
       if (mounted) setState(() => _saving = false);
     }

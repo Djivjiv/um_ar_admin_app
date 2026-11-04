@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 /// Holds Supabase credentials and the one-time initialization entrypoint.
@@ -10,8 +11,13 @@ class SupabaseConfig {
       'eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlvcXNqam5obWx1cWl2a2dpd29hIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0ODQzMTcsImV4cCI6MjEwMTA2MDMxN30.'
       'xnRaFoN2k1GfThYYLkGztzGSWmVzE8gVNgpgBpZDmC8';
 
+  /// Replaces [client] in tests, so repositories can run against a fake
+  /// server without [initialize].
+  @visibleForTesting
+  static SupabaseClient? testClient;
+
   /// The shared Supabase client. Only valid after [initialize] completes.
-  static SupabaseClient get client => Supabase.instance.client;
+  static SupabaseClient get client => testClient ?? Supabase.instance.client;
 
   /// Must be called once in `main()` before `runApp`.
   static Future<void> initialize() async {

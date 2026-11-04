@@ -1,5 +1,6 @@
 import '../../core/config/supabase_config.dart';
 import '../../domain/models/facility_content_model.dart';
+import 'paged_query.dart';
 import 'repository_exception.dart';
 
 class ContentRepository {
@@ -8,11 +9,13 @@ class ContentRepository {
 
   Future<List<FacilityContentModel>> getAll() async {
     try {
-      final rows =
-          await _client.from(_table).select().order('created_at', ascending: false);
-      return (rows as List)
-          .map((e) => FacilityContentModel.fromJson(e as Map<String, dynamic>))
-          .toList();
+      final rows = await fetchAllPages((a, b) => _client
+          .from(_table)
+          .select()
+          .order('created_at', ascending: false)
+          .order('id')
+          .range(a, b));
+      return rows.map(FacilityContentModel.fromJson).toList();
     } catch (e) {
       throw RepositoryException('Failed to load facility content', e);
     }
@@ -20,14 +23,14 @@ class ContentRepository {
 
   Future<List<FacilityContentModel>> getByBuilding(int buildingId) async {
     try {
-      final rows = await _client
+      final rows = await fetchAllPages((a, b) => _client
           .from(_table)
           .select()
           .eq('building_id', buildingId)
-          .order('created_at', ascending: false);
-      return (rows as List)
-          .map((e) => FacilityContentModel.fromJson(e as Map<String, dynamic>))
-          .toList();
+          .order('created_at', ascending: false)
+          .order('id')
+          .range(a, b));
+      return rows.map(FacilityContentModel.fromJson).toList();
     } catch (e) {
       throw RepositoryException('Failed to load content for building', e);
     }
@@ -68,7 +71,11 @@ class ContentRepository {
 
   Future<void> delete(String id) async {
     try {
-      await _client.from(_table).delete().eq('id', id);
+      final rows =
+          await _client.from(_table).delete().eq('id', id).select('id');
+      requireAffected(rows, 'Deleting the content');
+    } on RepositoryException {
+      rethrow;
     } catch (e) {
       throw RepositoryException('Failed to delete content', e);
     }

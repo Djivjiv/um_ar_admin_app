@@ -1,26 +1,33 @@
 import 'dart:async';
 import 'dart:collection';
-import 'dart:io';
 import 'dart:math' as math;
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
+import '../../../core/config/maptiler_config.dart';
 import '../../../core/constants/app_colors.dart';
+import '../../../core/utils/entrance_links.dart';
+import '../../../core/utils/file_save.dart';
 import '../../../core/utils/ui_helpers.dart';
 import '../../../data/repositories/building_repository.dart';
+import '../../../data/repositories/entrance_link_repository.dart';
 import '../../../data/repositories/node_repository.dart';
+import '../../../data/repositories/paged_query.dart';
 import '../../../domain/models/building_model.dart';
+import '../../../domain/models/indoor_node_model.dart';
 import '../../../domain/models/outdoor_edge_model.dart';
 import '../../../domain/models/outdoor_node_model.dart';
 import '../../widgets/confirm_dialog.dart';
+import '../../widgets/error_banner.dart';
+import '../../widgets/maptiler_key_notice.dart';
+import 'entrance_node_preview.dart';
 
 // --- MapTiler + campus config ---------------------------------------------
 
-const _mapTilerKey = '7IdsZLpK0EDETzZ6ITe6';
+const _mapTilerKey = MapTilerConfig.apiKey;
 const _baseTilesUrl =
     'https://api.maptiler.com/maps/streets-v2/{z}/{x}/{y}.png?key=$_mapTilerKey';
 const _overlayTilesUrl =
@@ -79,11 +86,15 @@ class CampusMapEditorScreen extends StatefulWidget {
 class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
   final _repo = NodeRepository();
   final _buildingRepo = BuildingRepository();
+  final _entranceRepo = EntranceLinkRepository();
   final _mapController = MapController();
 
   List<OutdoorNodeModel> _nodes = [];
   List<OutdoorEdgeModel> _edges = [];
   List<BuildingModel> _buildings = [];
+
+  /// Set when buildings failed to load in [_load]; shown over the map.
+  Object? _buildingsError;
   bool _loading = true;
   Object? _error;
 
@@ -169,10 +180,12 @@ class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
       // Buildings are for the dropdown only — don't fail the whole screen if
       // they can't be read (e.g. missing RLS select policy).
       List<BuildingModel> buildings = [];
+      Object? buildingsError;
       try {
         buildings = await _buildingRepo.getAll();
       } catch (be) {
         debugPrint('buildings fetch failed (dropdown will be empty): $be');
+        buildingsError = be;
       }
       debugPrint('Fetched ${nodes.length} nodes from Supabase');
       debugPrint('Fetched ${edges.length} edges from Supabase');
@@ -180,6 +193,7 @@ class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
         _nodes = nodes;
         _edges = edges;
         _buildings = buildings;
+        _buildingsError = buildingsError;
         _loading = false;
       });
     } catch (e) {
@@ -200,7 +214,7 @@ class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
         _edges = edges;
       });
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _refresh);
     }
   }
 
@@ -242,7 +256,9 @@ class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
       });
       if (mounted) context.showSuccess('Display name saved');
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) {
+        context.showError(e, onRetry: () => _saveDisplayName(building, name));
+      }
     }
   }
 
@@ -314,19 +330,19 @@ class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
     if (_mode == _EditorMode.addNode) {
       final model = await showDialog<OutdoorNodeModel>(
         context: context,
-        builder: (_) => _NodeDialog(
+        builder: (_) => CampusNodeDialog(
           point: point,
           buildingRepo: _buildingRepo,
         ),
       );
       if (model == null) return;
       try {
-        await _repo.createNode(model);
+        await _entranceRepo.save(model);
         if (mounted) context.showSuccess('Node "${model.id}" added');
         setState(() => _mode = _EditorMode.none);
         await _refresh();
       } catch (e) {
-        if (mounted) context.showError(e);
+        if (mounted) context.showError(e, onRetry: () => _handleMapTap(point));
       }
       return;
     }
@@ -350,18 +366,18 @@ class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
   Future<void> _editNode(OutdoorNodeModel node) async {
     final model = await showDialog<OutdoorNodeModel>(
       context: context,
-      builder: (_) => _NodeDialog(
+      builder: (_) => CampusNodeDialog(
         existing: node,
         buildingRepo: _buildingRepo,
       ),
     );
     if (model == null) return;
     try {
-      await _repo.updateNode(model);
+      await _entranceRepo.save(model, previous: node);
       if (mounted) context.showSuccess('Node "${model.id}" updated');
       await _refresh();
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: () => _editNode(node));
     }
   }
 
@@ -382,7 +398,7 @@ class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
       }
       await _refresh();
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: () => _deleteNode(node));
     }
   }
 
@@ -420,7 +436,9 @@ class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
       });
       await _refresh();
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) {
+        context.showError(e, onRetry: () => _promptAddEdge(fromId, toId));
+      }
     }
   }
 
@@ -437,7 +455,7 @@ class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
       if (mounted) context.showSuccess('Edge deleted');
       await _refresh();
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: () => _deleteEdge(edge));
     }
   }
 
@@ -1374,6 +1392,29 @@ class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
               ),
             ),
           Positioned(left: 12, bottom: 12, child: _Legend()),
+          Positioned(
+            top: 100,
+            left: 12,
+            right: 12,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const MapTilerKeyNotice(),
+                if (_buildingsError != null)
+                  Material(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(8),
+                    child: ErrorBanner(
+                      message: 'Could not load buildings, so labels and '
+                          'building lists are empty: $_buildingsError',
+                      onRetry: _load,
+                      margin: EdgeInsets.zero,
+                    ),
+                  ),
+              ],
+            ),
+          ),
           if (!_loading && _error == null && _mappableNodeCount == 0)
             Positioned(
               top: 56,
@@ -1426,16 +1467,18 @@ class _CampusMapEditorScreenState extends State<CampusMapEditorScreen> {
         },
       ),
       children: [
-        TileLayer(
-          urlTemplate: _baseTilesUrl,
-          userAgentPackageName: 'com.umindanao.um_ar_admin',
-          maxNativeZoom: 20,
-        ),
-        TileLayer(
-          urlTemplate: _overlayTilesUrl,
-          userAgentPackageName: 'com.umindanao.um_ar_admin',
-          maxNativeZoom: 20,
-        ),
+        if (MapTilerConfig.isConfigured) ...[
+          TileLayer(
+            urlTemplate: _baseTilesUrl,
+            userAgentPackageName: 'com.umindanao.um_ar_admin',
+            maxNativeZoom: 20,
+          ),
+          TileLayer(
+            urlTemplate: _overlayTilesUrl,
+            userAgentPackageName: 'com.umindanao.um_ar_admin',
+            maxNativeZoom: 20,
+          ),
+        ],
         PolylineLayer(polylines: _polylines()),
         MarkerLayer(markers: _arrowMarkers()),
         MarkerLayer(markers: _nodeMarkers()),
@@ -1794,23 +1837,26 @@ class _SelectedBuildingPanelState extends State<_SelectedBuildingPanel> {
 
 // --- node dialog -------------------------------------------------------
 
-class _NodeDialog extends StatefulWidget {
+class CampusNodeDialog extends StatefulWidget {
   final LatLng? point;
   final OutdoorNodeModel? existing;
   final BuildingRepository buildingRepo;
 
-  const _NodeDialog({this.point, this.existing, required this.buildingRepo});
+  const CampusNodeDialog({
+    super.key,
+    this.point,
+    this.existing,
+    required this.buildingRepo,
+  });
 
   @override
-  State<_NodeDialog> createState() => _NodeDialogState();
+  State<CampusNodeDialog> createState() => _CampusNodeDialogState();
 }
 
-class _NodeDialogState extends State<_NodeDialog> {
+class _CampusNodeDialogState extends State<CampusNodeDialog> {
   late final TextEditingController _id;
   late final TextEditingController _name;
   late final TextEditingController _entranceLabel;
-  late final TextEditingController _indoorNodeId;
-  late final TextEditingController _floor;
   late String _type;
   late bool _isActive;
   late bool _isEntrance;
@@ -1818,6 +1864,17 @@ class _NodeDialogState extends State<_NodeDialog> {
   String? _qrCodeValue;
   bool _generatingQr = false;
   final _nodeRepo = NodeRepository();
+  final _entranceRepo = EntranceLinkRepository();
+
+  // Indoor entrance picker: the building's nodes, loaded when one is chosen.
+  String? _indoorNodeId;
+  BuildingEntranceData? _entranceData;
+  bool _loadingEntranceData = false;
+  Object? _entranceDataError;
+
+  /// Why the last Save was refused, with Retry.
+  Object? _saveError;
+  bool _checking = false;
 
   // Building dropdown data — fetched by the dialog itself, unfiltered.
   List<BuildingModel> _buildings = [];
@@ -1834,14 +1891,94 @@ class _NodeDialogState extends State<_NodeDialog> {
         text: e?.id ?? 'p${DateTime.now().millisecondsSinceEpoch}');
     _name = TextEditingController(text: e?.name ?? '');
     _entranceLabel = TextEditingController(text: e?.entranceLabel ?? '');
-    _indoorNodeId = TextEditingController(text: e?.indoorNodeId ?? '');
-    _floor = TextEditingController(text: (e?.floor ?? 1).toString());
+    _indoorNodeId = e?.indoorNodeId;
     _type = _nodeTypes.contains(e?.type) ? e!.type! : _nodeTypes.first;
     _isActive = e?.isActive ?? true;
     _isEntrance = e?.isEntrance ?? false;
     _buildingId = e?.buildingId;
     _qrCodeValue = e?.qrCodeValue;
     _fetchBuildings();
+    if (_isEntrance) _fetchEntranceData();
+  }
+
+  /// Loads the picker for the chosen building. A building change can outrun
+  /// a slower earlier load, so a result for another building is dropped.
+  Future<void> _fetchEntranceData() async {
+    final building = int.tryParse(_buildingId ?? '');
+    setState(() {
+      _entranceData = null;
+      _entranceDataError = null;
+      _loadingEntranceData = building != null;
+    });
+    if (building == null) return;
+    try {
+      final data = await _entranceRepo.loadForBuilding(building);
+      if (!mounted || int.tryParse(_buildingId ?? '') != building) return;
+      setState(() {
+        _entranceData = data;
+        _loadingEntranceData = false;
+      });
+    } catch (e) {
+      if (!mounted || int.tryParse(_buildingId ?? '') != building) return;
+      setState(() {
+        _entranceDataError = e;
+        _loadingEntranceData = false;
+      });
+    }
+  }
+
+  IndoorNodeModel? get _selectedIndoorNode {
+    for (final n in _entranceData?.entranceNodes ?? const <IndoorNodeModel>[]) {
+      if (n.id == _indoorNodeId) return n;
+    }
+    return null;
+  }
+
+  OutdoorNodeModel? _model() {
+    final id = _id.text.trim();
+    final lat = widget.existing?.lat ?? widget.point?.latitude;
+    final lng = widget.existing?.lng ?? widget.point?.longitude;
+    if (id.isEmpty) return null;
+    final indoor = _selectedIndoorNode;
+    final data = _entranceData;
+    return OutdoorNodeModel(
+      id: id,
+      name: _name.text.trim().isEmpty ? null : _name.text.trim(),
+      type: _type,
+      lat: lat,
+      lng: lng,
+      buildingId: _isEntrance ? _buildingId : null,
+      isEntrance: _isEntrance,
+      entranceLabel: _isEntrance && _entranceLabel.text.trim().isNotEmpty
+          ? _entranceLabel.text.trim()
+          : null,
+      indoorNodeId: _isEntrance ? indoor?.id : null,
+      // The floor this entrance leads to is the indoor node's floor.
+      floor: _isEntrance && indoor != null && data != null
+          ? indoorNodeFloor(indoor, data.plans)
+          : widget.existing?.floor ?? 1,
+      qrCodeValue: _isEntrance ? _qrCodeValue : null,
+      isActive: _isActive,
+    );
+  }
+
+  /// Validates against the database before closing, so a refused link stays
+  /// in the form with its reason and a Retry.
+  Future<void> _submit() async {
+    final model = _model();
+    if (model == null) return;
+    setState(() {
+      _checking = true;
+      _saveError = null;
+    });
+    try {
+      await _entranceRepo.checkLink(model);
+      if (mounted) Navigator.pop(context, model);
+    } catch (e) {
+      if (mounted) setState(() => _saveError = e);
+    } finally {
+      if (mounted) setState(() => _checking = false);
+    }
   }
 
   /// Builds the deep-link value, saves it immediately if this node already
@@ -1868,7 +2005,7 @@ class _NodeDialogState extends State<_NodeDialog> {
           ? 'QR code generated and saved'
           : 'QR code generated — save the node to store it');
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _generateQr);
     } finally {
       if (mounted) setState(() => _generatingQr = false);
     }
@@ -1888,22 +2025,17 @@ class _NodeDialogState extends State<_NodeDialog> {
         throw Exception('Could not render the QR code image');
       }
       final bytes = imageData.buffer.asUint8List();
-      final path = await FilePicker.platform.saveFile(
-        dialogTitle: 'Save QR Code',
+      final path = await saveBytes(
         fileName: '${_id.text.trim()}_qr.png',
-        type: FileType.custom,
-        allowedExtensions: const ['png'],
         bytes: bytes,
+        dialogTitle: 'Save QR Code',
+        extension: 'png',
+        mimeType: 'image/png',
       );
       if (path == null) return;
-      // Some desktop platforms return the chosen path without writing bytes.
-      final file = File(path);
-      if (!await file.exists() || (await file.length()) == 0) {
-        await file.writeAsBytes(bytes, flush: true);
-      }
       if (mounted) context.showSuccess('QR code saved to $path');
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _downloadQr);
     }
   }
 
@@ -1913,8 +2045,9 @@ class _NodeDialogState extends State<_NodeDialog> {
       _buildingsError = null;
     });
     try {
-      // ALL buildings, no noRoomsBuildings filtering.
-      final list = await widget.buildingRepo.getAll();
+      // No noRoomsBuildings filtering. Inactive ones come too, but only the
+      // node's own building is offered (see _buildingField).
+      final list = await widget.buildingRepo.getAll(status: ActiveFilter.all);
       list.sort(
           (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
       if (!mounted) return;
@@ -1936,8 +2069,6 @@ class _NodeDialogState extends State<_NodeDialog> {
     _id.dispose();
     _name.dispose();
     _entranceLabel.dispose();
-    _indoorNodeId.dispose();
-    _floor.dispose();
     super.dispose();
   }
 
@@ -1972,20 +2103,128 @@ class _NodeDialogState extends State<_NodeDialog> {
         ),
       );
     }
-    final matches =
-        _buildings.any((b) => b.id?.toString() == _buildingId);
+    final options =
+        selectableBuildings(_buildings, int.tryParse(_buildingId ?? ''));
+    final matches = options.any((b) => b.id?.toString() == _buildingId);
     return DropdownButtonFormField<String>(
       // Rebuild the form field once buildings arrive so a pre-linked building
       // is actually shown as selected.
-      key: ValueKey('building-dd-${_buildings.length}'),
+      key: ValueKey('building-dd-${options.length}'),
       initialValue: matches ? _buildingId : null,
       decoration: const InputDecoration(labelText: 'Building'),
       isExpanded: true,
       items: [
-        for (final b in _buildings)
-          DropdownMenuItem(value: b.id?.toString(), child: Text(b.name)),
+        for (final b in options)
+          DropdownMenuItem(
+              value: b.id?.toString(), child: Text(buildingOptionLabel(b))),
       ],
-      onChanged: (v) => setState(() => _buildingId = v),
+      onChanged: (v) {
+        setState(() {
+          _buildingId = v;
+          _indoorNodeId = null;
+          _saveError = null;
+        });
+        _fetchEntranceData();
+      },
+    );
+  }
+
+  /// The required "Indoor entrance node" picker.
+  Widget _indoorNodePicker() {
+    const small = TextStyle(fontSize: 11, color: AppColors.textSecondary);
+    if (int.tryParse(_buildingId ?? '') == null) {
+      return const Text('Choose a building to pick its indoor entrance node.',
+          style: small);
+    }
+    if (_loadingEntranceData) return const LinearProgressIndicator();
+    final error = _entranceDataError;
+    if (error != null) {
+      return ErrorBanner(
+        message: 'Could not load indoor nodes: $error',
+        onRetry: _fetchEntranceData,
+      );
+    }
+    final data = _entranceData;
+    if (data == null) return const SizedBox.shrink();
+    if (data.entranceNodes.isEmpty) {
+      return ErrorBanner(
+        message: 'This building has no indoor entrance nodes yet. Add a node '
+            'labelled "entrance" in the floor plan editor, or turn off Is '
+            'Building Entrance.',
+        retryLabel: 'Reload',
+        onRetry: _fetchEntranceData,
+      );
+    }
+
+    final inUse =
+        indoorNodesInUse(data.entrances, exceptOutdoorId: _id.text.trim());
+    final selected = _selectedIndoorNode;
+    final stale = selected == null && (_indoorNodeId ?? '').isNotEmpty;
+    final warning = selected == null
+        ? null
+        : entranceFloorWarning(
+            target: selected,
+            buildingNodes: data.entranceNodes,
+            plans: data.plans,
+          );
+    final imageUrl = data.plans[selected?.floorPlanId]?.imageUrl ?? '';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        DropdownButtonFormField<String>(
+          key: ValueKey('indoor-node-$_buildingId'),
+          initialValue: selected?.id,
+          isExpanded: true,
+          decoration:
+              const InputDecoration(labelText: 'Indoor entrance node *'),
+          items: [
+            for (final n in data.entranceNodes)
+              DropdownMenuItem(
+                value: n.id,
+                enabled: !inUse.containsKey(n.id),
+                child: Text(
+                  inUse.containsKey(n.id)
+                      ? '${entranceNodeLabel(n, data.plans)} — used by '
+                          '${inUse[n.id]}'
+                      : entranceNodeLabel(n, data.plans),
+                  overflow: TextOverflow.ellipsis,
+                  style: inUse.containsKey(n.id)
+                      ? const TextStyle(color: AppColors.textSecondary)
+                      : null,
+                ),
+              ),
+          ],
+          onChanged: (v) => setState(() {
+            _indoorNodeId = v;
+            _saveError = null;
+          }),
+        ),
+        if (stale)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              'The saved link ($_indoorNodeId) is not an entrance node of '
+              'this building. Choose one above.',
+              style: const TextStyle(fontSize: 11, color: AppColors.errorRed),
+            ),
+          ),
+        if (warning != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(warning,
+                style: const TextStyle(
+                    fontSize: 11, color: AppColors.warningAmber)),
+          ),
+        if (selected != null && imageUrl.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: EntranceNodePreview(
+              imageUrl: imageUrl,
+              x: selected.x,
+              y: selected.y,
+            ),
+          ),
+      ],
     );
   }
 
@@ -2031,7 +2270,13 @@ class _NodeDialogState extends State<_NodeDialog> {
                 contentPadding: EdgeInsets.zero,
                 title: const Text('Is Building Entrance'),
                 value: _isEntrance,
-                onChanged: (v) => setState(() => _isEntrance = v),
+                onChanged: (v) {
+                  setState(() {
+                    _isEntrance = v;
+                    _saveError = null;
+                  });
+                  if (v && _entranceData == null) _fetchEntranceData();
+                },
               ),
               if (_isEntrance) ...[
                 const SizedBox(height: 4),
@@ -2045,20 +2290,7 @@ class _NodeDialogState extends State<_NodeDialog> {
                   ),
                 ),
                 const SizedBox(height: 10),
-                TextField(
-                  controller: _floor,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                      labelText: 'Floor (which floor this entrance leads to)'),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _indoorNodeId,
-                  decoration: const InputDecoration(
-                    labelText: 'Links to Indoor Node (optional)',
-                    hintText: 'Indoor node id e.g. n1',
-                  ),
-                ),
+                _indoorNodePicker(),
                 const Divider(height: 24),
                 const Text('QR Code',
                     style:
@@ -2137,6 +2369,14 @@ class _NodeDialogState extends State<_NodeDialog> {
                         fontSize: 11, color: AppColors.textSecondary),
                   ),
                 ),
+              if (_saveError != null) ...[
+                const SizedBox(height: 10),
+                ErrorBanner(
+                  message: _saveError.toString(),
+                  onRetry: _submit,
+                  margin: EdgeInsets.zero,
+                ),
+              ],
             ],
           ),
         ),
@@ -2146,31 +2386,7 @@ class _NodeDialogState extends State<_NodeDialog> {
             onPressed: () => Navigator.pop(context),
             child: const Text('Cancel')),
         ElevatedButton(
-          onPressed: () {
-            final id = _id.text.trim();
-            if (id.isEmpty) return;
-            Navigator.pop(
-              context,
-              OutdoorNodeModel(
-                id: id,
-                name: _name.text.trim().isEmpty ? null : _name.text.trim(),
-                type: _type,
-                lat: lat,
-                lng: lng,
-                buildingId: _isEntrance ? _buildingId : null,
-                isEntrance: _isEntrance,
-                entranceLabel: _isEntrance && _entranceLabel.text.trim().isNotEmpty
-                    ? _entranceLabel.text.trim()
-                    : null,
-                indoorNodeId: _isEntrance && _indoorNodeId.text.trim().isNotEmpty
-                    ? _indoorNodeId.text.trim()
-                    : null,
-                floor: int.tryParse(_floor.text.trim()) ?? 1,
-                qrCodeValue: _isEntrance ? _qrCodeValue : null,
-                isActive: _isActive,
-              ),
-            );
-          },
+          onPressed: _checking ? null : _submit,
           child: const Text('Save'),
         ),
       ],

@@ -1,17 +1,19 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'core/config/auth_redirect.dart';
 import 'core/config/supabase_config.dart';
 import 'core/theme/admin_theme.dart';
+import 'data/repositories/admin_session_guard.dart';
 import 'data/repositories/auth_repository.dart';
 import 'domain/models/building_model.dart';
 import 'domain/models/floor_plan_model.dart';
 import 'presentation/layout/admin_shell.dart';
 import 'presentation/screens/about_um/about_um_screen.dart';
+import 'presentation/screens/announcements/announcements_screen.dart';
 import 'presentation/screens/auth/login_screen.dart';
 import 'presentation/screens/analytics/analytics_screen.dart';
 import 'presentation/screens/buildings/buildings_screen.dart';
@@ -22,6 +24,9 @@ import 'presentation/screens/facilities/facilities_screen.dart';
 import 'presentation/screens/floor_plans/floor_plan_editor_screen.dart';
 import 'presentation/screens/floor_plans/floor_plans_screen.dart';
 import 'presentation/screens/floor_plans/georeferencing_screen.dart';
+import 'presentation/screens/feedback/feedback_comments_screen.dart';
+import 'presentation/screens/kiosk/kiosk_management_screen.dart';
+import 'presentation/screens/outdoor_ar/outdoor_ar_screen.dart';
 import 'presentation/screens/rooms/rooms_screen.dart';
 import 'presentation/screens/sus_responses/sus_responses_screen.dart';
 import 'presentation/screens/users/users_screen.dart';
@@ -50,12 +55,15 @@ class UmArAdminApp extends StatefulWidget {
 
 class _UmArAdminAppState extends State<UmArAdminApp> {
   StreamSubscription<AuthState>? _authSub;
+  final _adminGuard =
+      AdminSessionGuard(check: AuthRepository.instance.recheckAdmin);
 
   @override
   void initState() {
     super.initState();
     _authSub =
         SupabaseConfig.client.auth.onAuthStateChange.listen(_onAuthStateChange);
+    _adminGuard.start();
   }
 
   void _onAuthStateChange(AuthState state) {
@@ -80,6 +88,7 @@ class _UmArAdminAppState extends State<UmArAdminApp> {
   @override
   void dispose() {
     _authSub?.cancel();
+    _adminGuard.stop();
     super.dispose();
   }
 
@@ -100,15 +109,11 @@ final GoRouter appRouter = GoRouter(
   redirect: (context, state) {
     // Read the live session directly. There is never a restored session at
     // launch (main() signs out), so this always sends a fresh launch to /login.
-    final hasSession =
-        SupabaseConfig.client.auth.currentSession != null;
-    final atLogin = state.matchedLocation == '/login';
-    // No active session, or a session that isn't a confirmed admin → /login.
-    if (!hasSession || !AuthRepository.instance.isAdmin) {
-      return atLogin ? null : '/login';
-    }
-    if (atLogin) return '/dashboard';
-    return null;
+    return adminRedirect(
+      hasSession: SupabaseConfig.client.auth.currentSession != null,
+      isAdmin: AuthRepository.instance.isAdmin,
+      atLogin: state.matchedLocation == '/login',
+    );
   },
   routes: [
     GoRoute(
@@ -127,7 +132,6 @@ final GoRouter appRouter = GoRouter(
             building: extra['building'] as BuildingModel,
             floorNumber: extra['floorNumber'] as int,
             floorLabel: extra['floorLabel'] as String,
-            imageFile: extra['imageFile'] as File?,
             existingFloorPlan: extra['existingFloorPlan'] as FloorPlanModel?,
           ),
         );
@@ -167,6 +171,11 @@ final GoRouter appRouter = GoRouter(
               const NoTransitionPage(child: CampusMapEditorScreen()),
         ),
         GoRoute(
+          path: '/outdoor-ar',
+          pageBuilder: (context, state) =>
+              const NoTransitionPage(child: OutdoorArScreen()),
+        ),
+        GoRoute(
           path: '/floor-plans',
           pageBuilder: (context, state) =>
               const NoTransitionPage(child: FloorPlansScreen()),
@@ -189,6 +198,11 @@ final GoRouter appRouter = GoRouter(
               const NoTransitionPage(child: ContextContentScreen()),
         ),
         GoRoute(
+          path: '/announcements',
+          pageBuilder: (context, state) =>
+              const NoTransitionPage(child: AnnouncementsScreen()),
+        ),
+        GoRoute(
           path: '/about-um',
           pageBuilder: (context, state) =>
               const NoTransitionPage(child: AboutUmScreen()),
@@ -204,6 +218,11 @@ final GoRouter appRouter = GoRouter(
               const NoTransitionPage(child: VisitorSessionsScreen()),
         ),
         GoRoute(
+          path: '/kiosk',
+          pageBuilder: (context, state) =>
+              const NoTransitionPage(child: KioskManagementScreen()),
+        ),
+        GoRoute(
           path: '/analytics',
           pageBuilder: (context, state) =>
               const NoTransitionPage(child: AnalyticsScreen()),
@@ -212,6 +231,11 @@ final GoRouter appRouter = GoRouter(
           path: '/sus-responses',
           pageBuilder: (context, state) =>
               const NoTransitionPage(child: SusResponsesScreen()),
+        ),
+        GoRoute(
+          path: '/feedback-comments',
+          pageBuilder: (context, state) =>
+              const NoTransitionPage(child: FeedbackCommentsScreen()),
         ),
       ],
     ),

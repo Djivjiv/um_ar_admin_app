@@ -2,11 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../../../core/constants/app_colors.dart';
+import '../../../core/utils/date_range.dart';
 import '../../../core/utils/excel_export.dart';
+import '../../../core/utils/navigation_metrics.dart';
 import '../../../core/utils/ui_helpers.dart';
 import '../../../data/repositories/analytics_repository.dart';
 import '../../widgets/charts.dart';
 import '../../widgets/stat_card.dart';
+import 'navigation_metrics_section.dart';
 
 class AnalyticsScreen extends StatefulWidget {
   const AnalyticsScreen({super.key});
@@ -16,24 +19,18 @@ class AnalyticsScreen extends StatefulWidget {
 }
 
 class _AnalyticsData {
-  final List<ChartPoint> sessionsPerDay;
-  final List<ChartPoint> mostVisited;
-  final List<ChartPoint> userDistribution;
-  final List<ChartPoint> peakHours;
-  final double completionRate;
-  final double averageDistance;
-  final int sessionsToday;
+  final TripSummary trips;
+  final UserDistribution userDistribution;
+  final int tripsToday;
   final int totalUsers;
+  final NavigationMetrics navigationMetrics;
 
   _AnalyticsData({
-    required this.sessionsPerDay,
-    required this.mostVisited,
+    required this.trips,
     required this.userDistribution,
-    required this.peakHours,
-    required this.completionRate,
-    required this.averageDistance,
-    required this.sessionsToday,
+    required this.tripsToday,
     required this.totalUsers,
+    required this.navigationMetrics,
   });
 }
 
@@ -53,31 +50,28 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   }
 
   Future<_AnalyticsData> _load() async {
-    final from = _range.start;
-    final to = _range.end;
+    final span = wholeDays(_range.start, _range.end);
     final results = await Future.wait([
-      _repo.getSessionsPerDay(from: from, to: to),
-      _repo.getMostVisitedBuildings(from: from, to: to),
-      _repo.getUserDistribution(),
-      _repo.getPeakHours(from: from, to: to),
-      _repo.getCompletionRate(from: from, to: to),
-      _repo.getAverageDistance(from: from, to: to),
-      _repo.getSessionsTodayCount(),
+      _repo.getTripSummary(from: span.from, to: span.to),
+      _repo.getUserDistribution(from: span.from, to: span.to),
+      _repo.getTripsTodayCount(),
       _repo.getTotalUsersCount(),
+      _repo.getNavigationMetrics(from: span.from, to: span.to),
     ]);
     return _AnalyticsData(
-      sessionsPerDay: results[0] as List<ChartPoint>,
-      mostVisited: results[1] as List<ChartPoint>,
-      userDistribution: results[2] as List<ChartPoint>,
-      peakHours: results[3] as List<ChartPoint>,
-      completionRate: results[4] as double,
-      averageDistance: results[5] as double,
-      sessionsToday: results[6] as int,
-      totalUsers: results[7] as int,
+      trips: results[0] as TripSummary,
+      userDistribution: results[1] as UserDistribution,
+      tripsToday: results[2] as int,
+      totalUsers: results[3] as int,
+      navigationMetrics: results[4] as NavigationMetrics,
     );
   }
 
-  void _reload() => setState(() => _future = _load());
+  void _reload() {
+    setState(() {
+      _future = _load();
+    });
+  }
 
   Future<void> _pickRange() async {
     final picked = await showDateRangePicker(
@@ -107,19 +101,26 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   Future<void> _export() async {
     setState(() => _exporting = true);
     try {
-      final rows =
-          await _repo.exportSessionsRows(from: _range.start, to: _range.end);
-      final path = await saveExcelFile(
-        'navigation_sessions_${DateFormat('yyyyMMdd').format(_range.start)}',
-        'Sessions',
-        rows,
+      final span = wholeDays(_range.start, _range.end);
+      final day = DateFormat('yyyy-MM-dd');
+      final sheets = await _repo.exportTripWorkbook(
+        from: span.from,
+        to: span.to,
+        rangeLabel:
+            '${day.format(_range.start)} to ${day.format(_range.end)}',
+      );
+      final fileDay = DateFormat('yyyyMMdd');
+      final path = await saveExcelWorkbook(
+        'navigation_trips_${fileDay.format(_range.start)}_'
+        '${fileDay.format(_range.end)}',
+        sheets,
       );
       if (mounted) {
         context.showSuccess(
             path == null ? 'Export cancelled' : 'Saved to $path');
       }
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: _export);
     } finally {
       if (mounted) setState(() => _exporting = false);
     }
@@ -179,6 +180,10 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   }
 
   Widget _content(_AnalyticsData d) {
+    final trips = d.trips;
+    final rate = trips.completionRate;
+    final distance = trips.averageDistance;
+    final unmatched = d.userDistribution.rowsWithoutPerson;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -193,26 +198,30 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
             final cards = [
               StatCard(
                 icon: Icons.route,
-                title: 'Sessions (range)',
-                value: '${d.sessionsPerDay.fold<double>(0, (a, b) => a + b.value).toInt()}',
+                title: 'Trips (range)',
+                value: '${trips.trips}',
                 iconColor: AppColors.primaryMaroon,
               ),
               StatCard(
                 icon: Icons.today,
-                title: 'Sessions Today',
-                value: '${d.sessionsToday}',
+                title: 'Trips Today',
+                value: '${d.tripsToday}',
                 iconColor: AppColors.infoBlue,
               ),
               StatCard(
                 icon: Icons.check_circle,
                 title: 'Completion Rate',
-                value: '${d.completionRate.toStringAsFixed(1)}%',
+                value: rate == null
+                    ? 'No data yet'
+                    : '${rate.toStringAsFixed(1)}%',
                 iconColor: AppColors.successGreen,
               ),
               StatCard(
                 icon: Icons.straighten,
                 title: 'Avg Distance',
-                value: '${d.averageDistance.toStringAsFixed(0)} m',
+                value: distance == null
+                    ? 'No data yet'
+                    : '${distance.toStringAsFixed(0)} m',
                 iconColor: AppColors.accentGold,
               ),
             ];
@@ -225,10 +234,21 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
             );
           },
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 8),
+        Text(
+          'Counted per trip: one start and end pair sharing a trip_id.'
+          '${trips.rowsWithoutTrip == 0 ? '' : ' ${trips.rowsWithoutTrip} '
+              'older ${trips.rowsWithoutTrip == 1 ? 'row' : 'rows'} with no '
+              'trip_id ${trips.rowsWithoutTrip == 1 ? 'is' : 'are'} left out.'} '
+          'Avg Distance ignores trips with a distance of 0 or empty.',
+          style: const TextStyle(fontSize: 12, color: AppColors.textSecondary),
+        ),
+        const SizedBox(height: 24),
+        NavigationMetricsSection(metrics: d.navigationMetrics),
+        const SizedBox(height: 24),
         ChartCard(
-          title: 'Navigation Sessions Over Time',
-          child: LineChartView(points: d.sessionsPerDay),
+          title: 'Trips Over Time',
+          child: LineChartView(points: trips.perDay),
         ),
         const SizedBox(height: 16),
         LayoutBuilder(
@@ -236,11 +256,11 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
             final two = constraints.maxWidth > 900;
             final a = ChartCard(
               title: 'Most Visited Buildings',
-              child: BarChartView(points: d.mostVisited),
+              child: BarChartView(points: trips.mostVisited),
             );
             final b = ChartCard(
               title: 'User Distribution',
-              child: DonutChartView(points: d.userDistribution),
+              child: DonutChartView(points: d.userDistribution.points),
             );
             if (!two) {
               return Column(children: [a, const SizedBox(height: 16), b]);
@@ -255,17 +275,27 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
             );
           },
         ),
+        const SizedBox(height: 8),
+        Text(
+          'User Distribution counts people active in this range: one per '
+          'user_id, or per device_code for visitors.'
+          '${unmatched == 0 ? '' : ' $unmatched ${unmatched == 1 ? 'row' : 'rows'} '
+              'with neither could not be counted.'}',
+          style: const TextStyle(fontSize: 12, color: AppColors.textSecondary),
+        ),
         const SizedBox(height: 16),
         ChartCard(
           title: 'Peak Hours',
           height: 120,
-          child: _PeakHoursHeatmap(points: d.peakHours),
+          child: _PeakHoursHeatmap(points: trips.peakHours),
         ),
         const SizedBox(height: 16),
         ChartCard(
           title: 'Completion Rate',
           height: 160,
-          child: _CompletionGauge(rate: d.completionRate),
+          child: rate == null
+              ? const Center(child: Text('No data yet'))
+              : _CompletionGauge(rate: rate),
         ),
       ],
     );
@@ -291,7 +321,7 @@ class _PeakHoursHeatmap extends StatelessWidget {
           children: [
             for (final p in points)
               Tooltip(
-                message: '${p.label}:00 — ${p.value.toInt()} sessions',
+                message: '${p.label}:00 — ${p.value.toInt()} trips',
                 child: Container(
                   width: cell.clamp(12, 40),
                   height: 48,
@@ -338,7 +368,7 @@ class _CompletionGauge extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 6),
-        const Text('of navigation sessions completed',
+        const Text('of trips completed',
             style: TextStyle(fontSize: 12, color: AppColors.textSecondary)),
       ],
     );

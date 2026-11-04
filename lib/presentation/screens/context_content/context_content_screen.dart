@@ -4,6 +4,7 @@ import '../../../core/constants/app_colors.dart';
 import '../../../core/utils/ui_helpers.dart';
 import '../../../data/repositories/building_repository.dart';
 import '../../../data/repositories/content_repository.dart';
+import '../../../data/repositories/paged_query.dart';
 import '../../../domain/models/building_model.dart';
 import '../../../domain/models/facility_content_model.dart';
 import '../../widgets/confirm_dialog.dart';
@@ -43,7 +44,8 @@ class _ContextContentScreenState extends State<ContextContentScreen> {
     try {
       final results = await Future.wait([
         _repo.getAll(),
-        _buildingRepo.getAll(),
+        // Every building, for names; pickers narrow it to the active ones.
+        _buildingRepo.getAll(status: ActiveFilter.all),
       ]);
       setState(() {
         _items = results[0] as List<FacilityContentModel>;
@@ -68,7 +70,7 @@ class _ContextContentScreenState extends State<ContextContentScreen> {
 
   String _buildingName(int? id) {
     final m = _buildings.where((b) => b.id == id);
-    return m.isEmpty ? '—' : m.first.name;
+    return m.isEmpty ? '—' : buildingOptionLabel(m.first);
   }
 
   Future<void> _openForm([FacilityContentModel? content]) async {
@@ -76,7 +78,10 @@ class _ContextContentScreenState extends State<ContextContentScreen> {
       context,
       title: content == null ? 'Add Content' : 'Edit Content',
       subtitle: content?.title,
-      body: ContentForm(content: content, buildings: _buildings),
+      body: ContentForm(
+        content: content,
+        buildings: selectableBuildings(_buildings, content?.buildingId),
+      ),
     );
     if (result == true) _load();
   }
@@ -87,7 +92,7 @@ class _ContextContentScreenState extends State<ContextContentScreen> {
       if (mounted) context.showSuccess('Status updated');
       _load();
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: () => _toggle(c));
     }
   }
 
@@ -99,7 +104,7 @@ class _ContextContentScreenState extends State<ContextContentScreen> {
       if (mounted) context.showSuccess('Deleted');
       _load();
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: () => _delete(c));
     }
   }
 
@@ -130,8 +135,10 @@ class _ContextContentScreenState extends State<ContextContentScreen> {
                     isDense: true, labelText: 'Building'),
                 items: [
                   const DropdownMenuItem(value: null, child: Text('All')),
-                  for (final b in _buildings)
-                    DropdownMenuItem(value: b.id, child: Text(b.name)),
+                  for (final b
+                      in selectableBuildings(_buildings, _filterBuilding))
+                    DropdownMenuItem(
+                        value: b.id, child: Text(buildingOptionLabel(b))),
                 ],
                 onChanged: (v) => setState(() => _filterBuilding = v),
               ),

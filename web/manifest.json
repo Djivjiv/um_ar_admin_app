@@ -1,11 +1,11 @@
 {
-    "name": "um_ar_admin",
-    "short_name": "um_ar_admin",
+    "name": "UM-AR Nav Admin",
+    "short_name": "UM-AR Admin",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "description": "Admin panel for UM-AR Nav, the AR campus navigation system for the University of Mindanao Matina Campus.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

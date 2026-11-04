@@ -14,6 +14,9 @@ class AppColors {
   static const Color warningAmber = Color(0xFFF59E0B);
   static const Color errorRed = Color(0xFFD32F2F);
   static const Color infoBlue = Color(0xFF185FA5);
+
+  /// Indoor nodes linked to a node in another building.
+  static const Color crossBuildingOrange = Color(0xFFEF6C00);
   static const Color sidebarBg = Color(0xFF7B1C1C);
   static const Color sidebarActiveBg = Color(0xFF9B2C2C);
 

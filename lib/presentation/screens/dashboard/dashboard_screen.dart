@@ -1,12 +1,13 @@
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
 
 import '../../../core/constants/app_colors.dart';
 import '../../../data/repositories/dashboard_repository.dart';
-import '../../../domain/models/announcement_model.dart';
+import '../../../data/repositories/kiosk_repository.dart';
+import '../../widgets/error_banner.dart';
 import '../../widgets/stat_card.dart';
-import '../../widgets/status_badge.dart';
 
 const _maroon = AppColors.primaryMaroon;
 const _gold = AppColors.accentGold;
@@ -27,8 +28,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
   late Future<SusSummary> _sus;
   late Future<List<CommentEntry>> _comments;
   late Future<List<BuildingVisit>> _mostVisited;
-  late Future<List<AnnouncementModel>> _announcements;
   late Future<SystemStatus> _status;
+  late Future<KioskSessionCounts> _kioskCounts;
 
   int _rangeDays = 7;
   DateTime _commentDate = DateTime.now();
@@ -36,19 +37,55 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void initState() {
     super.initState();
-    _topStats = _repo.getTopStats();
+    _topStats = _repo.getTopStats(rangeDays: _rangeDays);
     _series = _repo.getDailySeries(_rangeDays);
     _sus = _repo.getSusSummary();
     _comments = _repo.getComments(_commentDate);
     _mostVisited = _repo.getMostVisited();
-    _announcements = _repo.getRecentAnnouncements();
     _status = _repo.getSystemStatus();
+    _kioskCounts = KioskRepository().getSessionCounts();
+  }
+
+  void _retryTopStats() => setState(() {
+        _topStats = _repo.getTopStats(rangeDays: _rangeDays);
+        _kioskCounts = KioskRepository().getSessionCounts();
+      });
+
+  void _retrySeries() {
+    setState(() {
+      _series = _repo.getDailySeries(_rangeDays);
+    });
+  }
+
+  void _retrySus() {
+    setState(() {
+      _sus = _repo.getSusSummary();
+    });
+  }
+
+  void _retryComments() {
+    setState(() {
+      _comments = _repo.getComments(_commentDate);
+    });
+  }
+
+  void _retryMostVisited() {
+    setState(() {
+      _mostVisited = _repo.getMostVisited();
+    });
+  }
+
+  void _retryStatus() {
+    setState(() {
+      _status = _repo.getSystemStatus();
+    });
   }
 
   void _setRange(int days) {
     setState(() {
       _rangeDays = days;
       _series = _repo.getDailySeries(days);
+      _topStats = _repo.getTopStats(rangeDays: days);
     });
   }
 
@@ -93,48 +130,48 @@ class _DashboardScreenState extends State<DashboardScreen> {
       future: _topStats,
       builder: (context, snap) {
         final s = snap.data ?? const DashboardTopStats();
-        final loading = snap.connectionState == ConnectionState.waiting;
         final error = snap.hasError ? snap.error : null;
+        // Show "—", not 0, while loading or when the counts failed.
+        final blank =
+            snap.connectionState == ConnectionState.waiting || error != null;
         final cards = <Widget>[
           StatCard(
             icon: Icons.school,
             title: 'Total Users',
-            value: loading ? '—' : '${s.students}',
-            subtitle: 'Students',
+            value: blank ? '—' : '${s.students}',
+            subtitle: 'Active students',
           ),
           StatCard(
             icon: Icons.verified_user,
             title: 'Registered Accounts',
-            value: loading ? '—' : '${s.registeredAccounts}',
-            subtitle: 'Verified',
+            value: blank ? '—' : '${s.registeredAccounts}',
+            subtitle: 'Verified and active',
             iconColor: _maroon,
           ),
           StatCard(
             icon: Icons.travel_explore,
             title: 'Active Visitors',
-            value: loading ? '—' : '${s.activeVisitors}',
+            value: blank ? '—' : '${s.activeVisitors}',
             subtitle: 'Sessions live',
             iconColor: _maroon,
           ),
           StatCard(
             icon: Icons.groups,
             title: 'Active Users',
-            value: loading ? '—' : '${s.activeUsers}',
+            value: blank ? '—' : '${s.activeUsers}',
             subtitle: 'Accounts + visitors',
             iconColor: _maroon,
           ),
-          StatCard(
-            icon: Icons.tv,
-            title: 'Kiosk Users',
-            value: loading ? '—' : '${s.kioskUsers}',
-            subtitle: 'Kiosk sessions',
-            iconColor: _maroon,
+          _KioskStatCard(
+            counts: _kioskCounts,
+            rangeSessions: blank ? null : s.kioskUsers,
+            rangeDays: _rangeDays,
           ),
         ];
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            if (error != null) _inlineError(error),
+            if (error != null) _inlineError(error, _retryTopStats),
             _equalRow(cards),
           ],
         );
@@ -149,7 +186,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       leftFlex: 60,
       rightFlex: 40,
       left: _Panel(
-        title: 'Daily Activity',
+        title: 'Daily Trips',
         trailing: _RangeDropdown(days: _rangeDays, onChanged: _setRange),
         child: SizedBox(
           height: 280,
@@ -159,7 +196,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
               if (snap.connectionState == ConnectionState.waiting) {
                 return const Center(child: CircularProgressIndicator());
               }
-              if (snap.hasError) return _inlineError(snap.error!);
+              if (snap.hasError) {
+                return _inlineError(snap.error!, _retrySeries);
+              }
               final data = snap.data ?? const DailySeries();
               if (data.isEmpty) return _emptyChart();
               return Column(
@@ -167,10 +206,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   Expanded(child: _DailyLineChart(data: data)),
                   const SizedBox(height: 8),
                   const _Legend(items: [
-                    _LegendItem('Mobile sessions', _maroon),
-                    _LegendItem('Visitor sessions', _gold),
-                    _LegendItem('Kiosk sessions', _blue),
+                    _LegendItem('Signed-in trips', _maroon),
+                    _LegendItem('Visitor trips', _gold),
                   ]),
+                  const SizedBox(height: 4),
+                  _tripNote,
                 ],
               );
             },
@@ -178,7 +218,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ),
       ),
       right: _Panel(
-        title: 'User Distribution',
+        title: 'Daily Kiosk Sessions',
         child: SizedBox(
           height: 280,
           child: FutureBuilder<DailySeries>(
@@ -187,17 +227,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
               if (snap.connectionState == ConnectionState.waiting) {
                 return const Center(child: CircularProgressIndicator());
               }
-              if (snap.hasError) return _inlineError(snap.error!);
+              if (snap.hasError) {
+                return _inlineError(snap.error!, _retrySeries);
+              }
               final data = snap.data ?? const DailySeries();
               if (data.isEmpty) return _emptyChart();
               return Column(
                 children: [
-                  Expanded(child: _GroupedBarChart(data: data)),
+                  Expanded(child: _KioskBarChart(data: data)),
                   const SizedBox(height: 8),
                   const _Legend(items: [
-                    _LegendItem('Registered', _maroon),
-                    _LegendItem('Visitors', _gold),
-                    _LegendItem('Kiosk', _blue),
+                    _LegendItem('Kiosk sessions', _blue),
                   ]),
                 ],
               );
@@ -214,7 +254,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return FutureBuilder<SusSummary>(
       future: _sus,
       builder: (context, snap) {
-        final loading = snap.connectionState == ConnectionState.waiting;
+        final loading =
+            snap.connectionState == ConnectionState.waiting || snap.hasError;
         final s = snap.data ?? const SusSummary();
         final grade = s.grade;
         final gradeColor = switch (grade) {
@@ -226,13 +267,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            if (snap.hasError) _inlineError(snap.error!),
+            if (snap.hasError) _inlineError(snap.error!, _retrySus),
             _equalRow([
               StatCard(
                 icon: Icons.assignment_turned_in,
                 title: 'Survey Responses',
                 value: loading ? '—' : '${s.totalResponses}',
-                subtitle: 'App + kiosk',
+                subtitle: [
+                  'SUS, from the app',
+                  if (s.kioskSurveys > 0)
+                    'plus ${s.kioskSurveys} kiosk '
+                        '${s.kioskSurveys == 1 ? 'survey' : 'surveys'} '
+                        '(not SUS)',
+                  ?s.note,
+                ].join('. '),
                 iconColor: _maroon,
               ),
               StatCard(
@@ -270,7 +318,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               if (snap.connectionState == ConnectionState.waiting) {
                 return const Center(child: CircularProgressIndicator());
               }
-              if (snap.hasError) return _inlineError(snap.error!);
+              if (snap.hasError) return _inlineError(snap.error!, _retrySus);
               final s = snap.data ?? const SusSummary();
               return _SusDistributionChart(summary: s);
             },
@@ -292,7 +340,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
               if (snap.connectionState == ConnectionState.waiting) {
                 return const Center(child: CircularProgressIndicator());
               }
-              if (snap.hasError) return _inlineError(snap.error!);
+              if (snap.hasError) {
+                return _inlineError(snap.error!, _retryComments);
+              }
               final comments = snap.data ?? const [];
               if (comments.isEmpty) {
                 return const Center(
@@ -312,6 +362,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
+  static const _tripNote = Text(
+    'Counted per trip. Older rows with no trip_id are left out.',
+    style: TextStyle(fontSize: 11, color: AppColors.textSecondary),
+  );
+
   // ---- ROW 5 -----------------------------------------------------------
 
   Widget _row5() {
@@ -327,7 +382,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 if (snap.connectionState == ConnectionState.waiting) {
                   return const _PanelLoading();
                 }
-                if (snap.hasError) return _inlineError(snap.error!);
+                if (snap.hasError) {
+                  return _inlineError(snap.error!, _retryMostVisited);
+                }
                 final items = snap.data ?? const [];
                 if (items.isEmpty) {
                   return const _PanelEmpty('No navigation data yet');
@@ -342,27 +399,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         count: items[i].count,
                         fraction: max == 0 ? 0 : items[i].count / max,
                       ),
-                  ],
-                );
-              },
-            ),
-          ),
-          _Panel(
-            title: 'Recent Announcements',
-            child: FutureBuilder<List<AnnouncementModel>>(
-              future: _announcements,
-              builder: (context, snap) {
-                if (snap.connectionState == ConnectionState.waiting) {
-                  return const _PanelLoading();
-                }
-                if (snap.hasError) return _inlineError(snap.error!);
-                final items = snap.data ?? const [];
-                if (items.isEmpty) {
-                  return const _PanelEmpty('No announcements');
-                }
-                return Column(
-                  children: [
-                    for (final a in items) _AnnouncementRow(a),
+                    const SizedBox(height: 4),
+                    _tripNote,
                   ],
                 );
               },
@@ -376,20 +414,25 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 if (snap.connectionState == ConnectionState.waiting) {
                   return const _PanelLoading();
                 }
-                if (snap.hasError) return _inlineError(snap.error!);
+                if (snap.hasError) {
+                  return _inlineError(snap.error!, _retryStatus);
+                }
                 final s = snap.data ?? const SystemStatus();
+                String count(int? n) => n == null ? 'Could not load' : '$n';
                 return Column(
                   children: [
+                    if (s.errors.isNotEmpty)
+                      _inlineError(s.errors.join('\n'), _retryStatus),
                     _StatusRow.dot('Supabase connection', s.supabaseOk),
                     _StatusRow.dot('MapTiler API', s.mapTilerOk),
                     _StatusRow.value(
-                        'Total Buildings', '${s.totalBuildings}'),
+                        'Active Buildings', count(s.totalBuildings)),
                     _StatusRow.value(
-                        'Total Outdoor Nodes', '${s.totalOutdoorNodes}'),
+                        'Active Outdoor Nodes', count(s.totalOutdoorNodes)),
                     _StatusRow.value(
-                        'Total Indoor Nodes', '${s.totalIndoorNodes}'),
+                        'Active Indoor Nodes', count(s.totalIndoorNodes)),
                     _StatusRow.value(
-                        'Total Floor Plans', '${s.totalFloorPlans}'),
+                        'Active Floor Plans', count(s.totalFloorPlans)),
                     _StatusRow.value(
                       'Last data update',
                       s.lastDataUpdate == null
@@ -417,8 +460,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
               Expanded(child: panels[0]),
               const SizedBox(width: 16),
               Expanded(child: panels[1]),
-              const SizedBox(width: 16),
-              Expanded(child: panels[2]),
             ],
           ),
         );
@@ -478,19 +519,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  Widget _inlineError(Object error) {
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: AppColors.errorRed.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Text(error.toString(),
-          style: const TextStyle(color: AppColors.errorRed, fontSize: 12)),
-    );
-  }
+  Widget _inlineError(Object error, VoidCallback onRetry) =>
+      ErrorBanner(message: error.toString(), onRetry: onRetry);
 
   Widget _emptyChart() => const Center(
         child: Text('No data available',
@@ -728,6 +758,12 @@ class _CommentTile extends StatelessWidget {
                             fontWeight: FontWeight.w600,
                             color: pillColor)),
                   ),
+                  if (entry.anonymousRef != null) ...[
+                    const SizedBox(width: 6),
+                    Text(entry.anonymousRef!,
+                        style: const TextStyle(
+                            fontSize: 10, color: AppColors.textSecondary)),
+                  ],
                   const Spacer(),
                   Text(
                     entry.at == null
@@ -795,63 +831,6 @@ class _RankRow extends StatelessWidget {
               backgroundColor: AppColors.backgroundGray,
               valueColor: const AlwaysStoppedAnimation(_gold),
             ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _AnnouncementRow extends StatelessWidget {
-  final AnnouncementModel announcement;
-  const _AnnouncementRow(this.announcement);
-
-  IconData get _icon {
-    switch ((announcement.type ?? '').toLowerCase()) {
-      case 'emergency':
-        return Icons.warning_amber_rounded;
-      case 'event':
-        return Icons.event;
-      case 'maintenance':
-        return Icons.build;
-      default:
-        return Icons.campaign;
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Row(
-        children: [
-          Icon(_icon, size: 18, color: _maroon),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(announcement.title,
-                    style: const TextStyle(
-                        fontSize: 13, fontWeight: FontWeight.w600),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis),
-                Text(
-                  announcement.createdAt == null
-                      ? ''
-                      : DateFormat('MMM d, y').format(announcement.createdAt!),
-                  style: const TextStyle(
-                      fontSize: 10, color: AppColors.textSecondary),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 8),
-          StatusBadge(
-            status: announcement.isExpired
-                ? BadgeStatus.inactive
-                : BadgeStatus.active,
-            label: announcement.isExpired ? 'Expired' : 'Active',
           ),
         ],
       ),
@@ -928,7 +907,7 @@ class _DailyLineChart extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final allValues = [...data.mobile, ...data.visitor, ...data.kiosk];
+    final allValues = [...data.registered, ...data.visitor];
     final maxY =
         allValues.fold<int>(0, (a, b) => a > b ? a : b).toDouble();
     final step = (data.days.length / 6).ceil().clamp(1, 999);
@@ -978,23 +957,21 @@ class _DailyLineChart extends StatelessWidget {
           touchTooltipData: LineTouchTooltipData(),
         ),
         lineBarsData: [
-          bar(data.mobile, _maroon),
+          bar(data.registered, _maroon),
           bar(data.visitor, _gold),
-          bar(data.kiosk, _blue),
         ],
       ),
     );
   }
 }
 
-class _GroupedBarChart extends StatelessWidget {
+class _KioskBarChart extends StatelessWidget {
   final DailySeries data;
-  const _GroupedBarChart({required this.data});
+  const _KioskBarChart({required this.data});
 
   @override
   Widget build(BuildContext context) {
-    final all = [...data.registered, ...data.visitor, ...data.kiosk];
-    final maxY = all.fold<int>(0, (a, b) => a > b ? a : b).toDouble();
+    final maxY = data.kiosk.fold<int>(0, (a, b) => a > b ? a : b).toDouble();
     final step = (data.days.length / 6).ceil().clamp(1, 999);
 
     return BarChart(
@@ -1032,16 +1009,9 @@ class _GroupedBarChart extends StatelessWidget {
           for (var i = 0; i < data.days.length; i++)
             BarChartGroupData(
               x: i,
-              barsSpace: 2,
               barRods: [
                 BarChartRodData(
-                    toY: data.registered[i].toDouble(),
-                    color: _maroon,
-                    width: 5),
-                BarChartRodData(
-                    toY: data.visitor[i].toDouble(), color: _gold, width: 5),
-                BarChartRodData(
-                    toY: data.kiosk[i].toDouble(), color: _blue, width: 5),
+                    toY: data.kiosk[i].toDouble(), color: _blue, width: 9),
               ],
             ),
         ],
@@ -1131,6 +1101,67 @@ class _SusDistributionChart extends StatelessWidget {
             ),
         ],
       ),
+    );
+  }
+}
+
+/// Kiosk sessions today / this week, with a link to Kiosk Management.
+class _KioskStatCard extends StatelessWidget {
+  final Future<KioskSessionCounts> counts;
+
+  /// Sessions in the selected range, from the top stats; null while loading.
+  final int? rangeSessions;
+  final int rangeDays;
+
+  const _KioskStatCard({
+    required this.counts,
+    required this.rangeSessions,
+    required this.rangeDays,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<KioskSessionCounts>(
+      future: counts,
+      builder: (context, snap) {
+        final loading = snap.connectionState == ConnectionState.waiting;
+        final c = snap.data ?? const KioskSessionCounts();
+        final String subtitle;
+        if (snap.hasError) {
+          subtitle = 'Could not load kiosk counts';
+        } else if (loading) {
+          subtitle = 'Loading…';
+        } else {
+          subtitle = '${c.thisWeek} this week'
+              '${rangeSessions == null ? '' : ' · $rangeSessions in last $rangeDays days'}';
+        }
+        return Material(
+          color: Colors.transparent,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: () => context.go('/kiosk'),
+            child: Stack(
+              children: [
+                StatCard(
+                  icon: Icons.tablet_mac,
+                  title: 'Kiosk Sessions Today',
+                  value: loading || snap.hasError ? '—' : '${c.today}',
+                  subtitle: subtitle,
+                  iconColor: _maroon,
+                ),
+                const Positioned(
+                  top: 10,
+                  right: 12,
+                  child: Tooltip(
+                    message: 'Open Kiosk Management',
+                    child: Icon(Icons.open_in_new, size: 16, color: _gold),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 }

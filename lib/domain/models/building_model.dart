@@ -1,5 +1,21 @@
 import '../../core/utils/parse_utils.dart';
 
+/// The buildings a picker offers: active ones, plus [keepId] when it is
+/// inactive, so editing a row already attached to one doesn't lose the link.
+/// Label options with [buildingOptionLabel] so that case is visible.
+List<BuildingModel> selectableBuildings(
+  Iterable<BuildingModel> buildings,
+  int? keepId,
+) =>
+    [
+      for (final b in buildings)
+        if (b.isActive || (keepId != null && b.id == keepId)) b,
+    ];
+
+/// "Main Hall", or "Main Hall (inactive)".
+String buildingOptionLabel(BuildingModel b) =>
+    b.isActive ? b.name : '${b.name} (inactive)';
+
 class BuildingModel {
   final int? id;
   final String name;
@@ -24,6 +40,14 @@ class BuildingModel {
   final double? labelLng;
   final String? displayName;
 
+  // Outdoor AR destination marker (user-app AR overlay). Read here but NOT
+  // written by [toJson] — they're saved only via
+  // BuildingRepository.updateArSettings, so regular building saves keep
+  // working even before db/building_ar_columns.sql has added the columns.
+  final String? arEmoji;
+  final String? arLabel;
+  final double? arArrivalRadiusM;
+
   const BuildingModel({
     this.id,
     required this.name,
@@ -44,6 +68,9 @@ class BuildingModel {
     this.labelLat,
     this.labelLng,
     this.displayName,
+    this.arEmoji,
+    this.arLabel,
+    this.arArrivalRadiusM,
   });
 
   factory BuildingModel.fromJson(Map<String, dynamic> json) {
@@ -67,6 +94,9 @@ class BuildingModel {
       labelLat: parseDouble(json['label_lat']),
       labelLng: parseDouble(json['label_lng']),
       displayName: json['display_name']?.toString(),
+      arEmoji: json['ar_emoji']?.toString(),
+      arLabel: json['ar_label']?.toString(),
+      arArrivalRadiusM: parseDouble(json['ar_arrival_radius_m']),
     );
   }
 
@@ -110,6 +140,9 @@ class BuildingModel {
     double? labelLat,
     double? labelLng,
     String? displayName,
+    String? arEmoji,
+    String? arLabel,
+    double? arArrivalRadiusM,
   }) {
     return BuildingModel(
       id: id ?? this.id,
@@ -131,6 +164,9 @@ class BuildingModel {
       labelLat: labelLat ?? this.labelLat,
       labelLng: labelLng ?? this.labelLng,
       displayName: displayName ?? this.displayName,
+      arEmoji: arEmoji ?? this.arEmoji,
+      arLabel: arLabel ?? this.arLabel,
+      arArrivalRadiusM: arArrivalRadiusM ?? this.arArrivalRadiusM,
     );
   }
 
@@ -158,32 +194,9 @@ class BuildingModel {
       labelLat: labelLat,
       labelLng: labelLng,
       displayName: null,
-    );
-  }
-
-  /// Explicitly resets the label position so it falls back to the building's
-  /// own lat/lng — see [clearDisplayName] for why this can't be [copyWith].
-  BuildingModel clearLabelPosition() {
-    return BuildingModel(
-      id: id,
-      name: name,
-      imageUrl: imageUrl,
-      lat: lat,
-      lng: lng,
-      shortName: shortName,
-      description: description,
-      departments: departments,
-      facilitiesList: facilitiesList,
-      floorCount: floorCount,
-      openingHours: openingHours,
-      contact: contact,
-      isAccessible: isAccessible,
-      isActive: isActive,
-      createdAt: createdAt,
-      updatedAt: updatedAt,
-      labelLat: null,
-      labelLng: null,
-      displayName: displayName,
+      arEmoji: arEmoji,
+      arLabel: arLabel,
+      arArrivalRadiusM: arArrivalRadiusM,
     );
   }
 }

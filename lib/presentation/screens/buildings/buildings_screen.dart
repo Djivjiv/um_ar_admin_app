@@ -6,9 +6,12 @@ import '../../../core/constants/app_colors.dart';
 import '../../../core/constants/no_rooms_buildings.dart';
 import '../../../core/utils/ui_helpers.dart';
 import '../../../data/repositories/building_repository.dart';
+import '../../../data/repositories/paged_query.dart';
 import '../../../domain/models/building_model.dart';
+import '../../widgets/active_filter_dropdown.dart';
 import '../../widgets/confirm_dialog.dart';
 import '../../widgets/slide_panel.dart';
+import '../../widgets/status_badge.dart';
 import 'building_form.dart';
 
 class BuildingsScreen extends StatefulWidget {
@@ -21,15 +24,20 @@ class BuildingsScreen extends StatefulWidget {
 class _BuildingsScreenState extends State<BuildingsScreen> {
   final _repo = BuildingRepository();
   late Future<List<BuildingModel>> _future;
+  ActiveFilter _status = ActiveFilter.active;
   String _search = '';
 
   @override
   void initState() {
     super.initState();
-    _future = _repo.getAll();
+    _future = _repo.getAll(status: _status);
   }
 
-  void _reload() => setState(() => _future = _repo.getAll());
+  void _reload() {
+    setState(() {
+      _future = _repo.getAll(status: _status);
+    });
+  }
 
   Future<void> _openForm([BuildingModel? building]) async {
     final result = await SlidePanel.show<bool>(
@@ -42,14 +50,19 @@ class _BuildingsScreenState extends State<BuildingsScreen> {
   }
 
   Future<void> _delete(BuildingModel b) async {
-    final ok = await ConfirmDialog.show(context, itemName: b.name);
+    final ok = await ConfirmDialog.show(
+      context,
+      itemName: b.name,
+      message: 'Floor plan nodes linked to its rooms and facilities will be '
+          'unlinked. This action cannot be undone.',
+    );
     if (!ok) return;
     try {
       await _repo.delete(b.id!);
       if (mounted) context.showSuccess('Building deleted');
       _reload();
     } catch (e) {
-      if (mounted) context.showError(e);
+      if (mounted) context.showError(e, onRetry: () => _delete(b));
     }
   }
 
@@ -70,6 +83,14 @@ class _BuildingsScreenState extends State<BuildingsScreen> {
                 ),
                 onChanged: (v) => setState(() => _search = v.toLowerCase()),
               ),
+            ),
+            const SizedBox(width: 12),
+            ActiveFilterDropdown(
+              value: _status,
+              onChanged: (v) {
+                _status = v;
+                _reload();
+              },
             ),
             const Spacer(),
             ElevatedButton.icon(
@@ -100,7 +121,11 @@ class _BuildingsScreenState extends State<BuildingsScreen> {
                       (b.shortName ?? '').toLowerCase().contains(_search))
                   .toList();
               if (items.isEmpty) {
-                return const Center(child: Text('No buildings found'));
+                return Center(
+                  child: Text(_status == ActiveFilter.inactive
+                      ? 'No inactive buildings found'
+                      : 'No buildings found'),
+                );
               }
               return LayoutBuilder(
                 builder: (context, constraints) {
@@ -176,14 +201,21 @@ class _BuildingCard extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  building.name,
-                  style: const TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.bold,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        building.name,
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.bold,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (!building.isActive) StatusBadge.fromBool(false),
+                  ],
                 ),
                 const SizedBox(height: 4),
                 Text(
